@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface-base text-slate-200 font-sans antialiased;
+    margin: 0;
+    overflow: hidden;
+    /* Disable the native text selection callout for a more native feel. */
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Allow selection where it actually makes sense (inputs, code, summaries). */
+  input,
+  textarea,
+  [data-selectable="true"] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}
+
+@layer components {
+  /* The draggable region for the custom/overlay title bar (macOS). */
+  .drag-region {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .no-drag {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+}
+
+/* A subtle, native-looking scrollbar. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3040;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4255;
+  background-clip: content-box;
+}

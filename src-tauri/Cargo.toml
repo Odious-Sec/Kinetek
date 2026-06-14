@@ -1,0 +1,41 @@
+[package]
+name = "kinetek"
+version = "0.1.0"
+description = "A local-first visual control center for your projects."
+authors = ["Kinetek"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# The Tauri application logic lives in a library crate so it can be shared
+# between the desktop binary (main.rs) and, later, mobile targets.
+[lib]
+name = "kinetek_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+# Lets the frontend make HTTP calls to AI providers via Rust (no CORS/CSP issues).
+tauri-plugin-http = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Cross-platform "move to Trash/Recycle Bin" so deletes are recoverable.
+trash = "5"
+# OS keychain access for the user's AI API key (never stored in plaintext).
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+# Unix-only: signal a dev server's whole process group when stopping a preview.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Smaller, faster release binaries for a desktop app.
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

@@ -205,3 +205,55 @@ export const KeyIcon = (p: IconProps) => (
     <path d="m10.5 12.5 8-8M16 6l2 2M19 3l2 2" />
   </svg>
 );
+
+export const GitCommitIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="3.5" />
+    <path d="M3 12h5.5M15.5 12H21" />
+  </svg>
+);
+
+export const MaximizeIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5" />
+  </svg>
+);
+
+export const MinimizeIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M8 3v5H3M21 8h-5V3M16 21v-5h5M3 16h5v5" />
+  </svg>
+);
+
+export const GithubIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.4 3.4 0 0 0-.9-2.6c3-.3 6.1-1.5 6.1-6.6a5.1 5.1 0 0 0-1.4-3.5 4.8 4.8 0 0 0-.1-3.5s-1.1-.3-3.7 1.4a12.6 12.6 0 0 0-6.6 0C6.3 1.6 5.2 1.9 5.2 1.9a4.8 4.8 0 0 0-.1 3.5A5.1 5.1 0 0 0 3.7 8.9c0 5.1 3.1 6.3 6.1 6.6a3.4 3.4 0 0 0-.9 2.6V22" />
+  </svg>
+);
+
+export const CloudDownloadIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 13v8m0 0-3.5-3.5M12 21l3.5-3.5" />
+    <path d="M20 16.6A4.5 4.5 0 0 0 18 8h-1.3A7 7 0 1 0 5 14.3" />
+  </svg>
+);
+
+export const StarIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 3l2.7 5.5 6 .9-4.3 4.2 1 6L12 17.8 6.6 19.6l1-6L3.3 9.4l6-.9z" />
+  </svg>
+);
+
+export const ClockIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </svg>
+);
+
+export const InfoIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 11v5M12 8h.01" />
+  </svg>
+);

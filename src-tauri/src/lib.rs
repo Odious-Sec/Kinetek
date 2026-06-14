@@ -1728,6 +1728,175 @@ async fn git_set_remote(path: String, url: String) -> Result<(), String> {
     .map_err(|e| format!("The remote task failed unexpectedly: {e}"))?
 }
 
+// --- Git history (commit graph) --------------------------------------------
+
+/// One commit in the history, with enough parent/ref info to draw a Fork-style
+/// graph on the frontend.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub hash: String,
+    pub short_hash: String,
+    /// Parent hashes (first = mainline parent). Merge commits have 2+.
+    pub parents: Vec<String>,
+    /// Decorations: branch/tag/HEAD names attached to this commit.
+    pub refs: Vec<String>,
+    /// Whether HEAD points at (or through) this commit.
+    pub is_head: bool,
+    pub author: String,
+    pub email: String,
+    /// ISO-8601 commit date.
+    pub date_iso: String,
+    /// Human "3 days ago" commit date.
+    pub date_relative: String,
+    pub subject: String,
+    /// Full commit body (may be empty).
+    pub body: String,
+}
+
+/// Read the commit history across all branches (most recent first), parsed for
+/// the visual graph. Returns Err if the folder isn't a git repo.
+#[tauri::command]
+async fn git_log(path: String, limit: Option<u32>) -> Result<Vec<CommitInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let n = limit.unwrap_or(300).to_string();
+        // Field separator \x1f, record separator \x1e — safe against newlines in
+        // the body/subject. Fields: H, h, P, D, an, ae, cI, cr, s, b.
+        let fmt = "%H%x1f%h%x1f%P%x1f%D%x1f%an%x1f%ae%x1f%cI%x1f%cr%x1f%s%x1f%b%x1e";
+        let out = run_git(
+            &p,
+            &[
+                "log",
+                "--all",
+                "--date-order",
+                "-n",
+                &n,
+                &format!("--pretty=format:{fmt}"),
+            ],
+        )?;
+
+        let mut commits = Vec::new();
+        for record in out.split('\u{1e}') {
+            let record = record.trim_start_matches('\n');
+            if record.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = record.split('\u{1f}').collect();
+            if f.len() < 9 {
+                continue;
+            }
+            let parents: Vec<String> = f[2]
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            let mut is_head = false;
+            let refs: Vec<String> = f[3]
+                .split(", ")
+                .filter_map(|raw| {
+                    let r = raw.trim();
+                    if r.is_empty() {
+                        return None;
+                    }
+                    // "HEAD -> main" → mark head, keep "main".
+                    if let Some(rest) = r.strip_prefix("HEAD -> ") {
+                        is_head = true;
+                        return Some(rest.to_string());
+                    }
+                    if r == "HEAD" {
+                        is_head = true;
+                        return Some("HEAD".to_string());
+                    }
+                    Some(r.to_string())
+                })
+                .collect();
+
+            commits.push(CommitInfo {
+                hash: f[0].to_string(),
+                short_hash: f[1].to_string(),
+                parents,
+                refs,
+                is_head,
+                author: f[4].to_string(),
+                email: f[5].to_string(),
+                date_iso: f[6].to_string(),
+                date_relative: f[7].to_string(),
+                subject: f[8].to_string(),
+                body: f.get(9).map(|s| s.trim_end().to_string()).unwrap_or_default(),
+            });
+        }
+        Ok(commits)
+    })
+    .await
+    .map_err(|e| format!("The git log task failed unexpectedly: {e}"))?
+}
+
+/// Clone a GitHub repo into `dest` (a parent folder). Returns a project card for
+/// the freshly-cloned folder. The token (if given) is used only for the clone
+/// transport and is scrubbed from the saved remote and any error text.
+#[tauri::command]
+async fn git_clone(url: String, dest: String, token: String) -> Result<ProjectInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let parent = PathBuf::from(&dest);
+        if !parent.is_dir() {
+            return Err(format!("\"{}\" is not a folder.", parent.display()));
+        }
+        let clean_url = url.trim().to_string();
+        // Folder name = repo name (last path segment, sans .git).
+        let name = clean_url
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .to_string();
+        if name.is_empty() {
+            return Err("Could not work out a folder name from that URL.".to_string());
+        }
+        let target = parent.join(&name);
+        if target.exists() {
+            return Err(format!(
+                "A folder named \"{name}\" already exists here. Move or rename it first."
+            ));
+        }
+
+        let token = token.trim();
+        let target_str = target.to_string_lossy().to_string();
+        let transport = if !token.is_empty() && clean_url.contains("github.com") {
+            let slug = parse_repo_slug(&clean_url);
+            format!("https://{token}@github.com/{slug}.git")
+        } else {
+            clean_url.clone()
+        };
+
+        // Clone from the parent directory into `name`.
+        run_git(&parent, &["clone", &transport, &name]).map_err(|e| {
+            let scrubbed = if token.is_empty() { e } else { e.replace(token, "***") };
+            format!("Clone failed: {scrubbed}")
+        })?;
+
+        // Never persist the token inside the cloned repo's remote URL.
+        if transport != clean_url {
+            let _ = run_git(&target, &["remote", "set-url", "origin", &clean_url]);
+        }
+
+        Ok(ProjectInfo {
+            id: target_str.clone(),
+            name,
+            path: target_str,
+            summary: String::new(),
+            status: "In Development".into(),
+            frameworks: detect_frameworks(&target),
+            has_preview: target.join("package.json").exists(),
+        })
+    })
+    .await
+    .map_err(|e| format!("The clone task failed unexpectedly: {e}"))?
+}
+
 // --- File explorer (read-only) ---------------------------------------------
 
 #[derive(Debug, Serialize)]
@@ -2153,6 +2322,8 @@ pub fn run() {
             git_push,
             git_init,
             git_set_remote,
+            git_log,
+            git_clone,
             read_dir,
             read_file_text,
             search_files,

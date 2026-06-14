@@ -5,7 +5,9 @@ import TitleBar from "./components/TitleBar";
 import Dashboard from "./components/Dashboard";
 import Sidebar, { type FolderSelection, type ViewMode } from "./components/Sidebar";
 import Explorer from "./components/Explorer";
+import GithubPage from "./components/GithubPage";
 import ProjectPanel from "./components/ProjectPanel";
+import ProjectPage from "./components/ProjectPage";
 import ProjectWizard from "./components/ProjectWizard";
 import ConfirmDialog from "./components/ConfirmDialog";
 import EditProjectDialog from "./components/EditProjectDialog";
@@ -59,6 +61,8 @@ export default function App() {
   // Editing + settings + AI.
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [inspectProject, setInspectProject] = useState<Project | null>(null);
+  // Full-page project view (id so it tracks edits/deletes).
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [explainingId, setExplainingId] = useState<string | null>(null);
 
@@ -397,56 +401,91 @@ export default function App() {
     ? projects.find((p) => p.id === inspectProject.id) ?? null
     : null;
 
+  // Live version of the full-page (expanded) project.
+  const expanded = expandedId
+    ? projects.find((p) => p.id === expandedId) ?? null
+    : null;
+
+  // Folder names already on disk, so the GitHub page can mark repos as "saved".
+  const localNames = useMemo(
+    () =>
+      new Set(
+        projects
+          .filter((p) => !p.id.startsWith("sample-"))
+          .map((p) => p.path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? p.name)
+      ),
+    [projects]
+  );
+
   return (
     <div className="flex h-full flex-col bg-surface-base">
       <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
 
       <div className="flex min-h-0 flex-1">
-        <Sidebar
-          view={view}
-          onView={setView}
-          folders={folders}
-          counts={sidebarCounts}
-          selected={selectedFolder}
-          onSelect={setSelectedFolder}
-          onCreate={createFolder}
-          onRename={renameFolder}
-          onDelete={deleteFolder}
-        />
-        <div className="min-h-0 min-w-0 flex-1">
-          {view === "explorer" ? (
-            <Explorer initialRoot={settings.defaultDir ?? ""} notify={notify} />
-          ) : (
-            <Dashboard
-              projects={projects}
-              scanning={scanning}
-              narrow={!!inspected}
+        {expanded ? (
+          <ProjectPage
+            project={expanded}
+            onBack={() => setExpandedId(null)}
+            onOpenInEditor={handleProceedToCode}
+            notify={notify}
+          />
+        ) : (
+          <>
+            <Sidebar
+              view={view}
+              onView={setView}
               folders={folders}
-              assignments={assignments}
-              selectedFolder={selectedFolder}
-              explainingId={explainingId}
-              onNewProject={() => setWizardOpen(true)}
-              onScanFolder={handleScanFolder}
-              onProceedToCode={handleProceedToCode}
-              onPreview={handlePreview}
-              onReveal={handleReveal}
-              onDelete={requestDelete}
-              onAssignFolder={assignFolder}
-              onEdit={setEditingProject}
-              onExplain={handleExplain}
-              onSelect={setInspectProject}
+              counts={sidebarCounts}
+              selected={selectedFolder}
+              onSelect={setSelectedFolder}
+              onCreate={createFolder}
+              onRename={renameFolder}
+              onDelete={deleteFolder}
             />
-          )}
-        </div>
-        {inspected && view === "dashboard" && (
-          <div className="min-h-0 w-[34%] min-w-[20rem] max-w-[40rem] shrink-0 animate-slide-in-right">
-            <ProjectPanel
-              project={inspected}
-              onClose={() => setInspectProject(null)}
-              onOpenInEditor={handleProceedToCode}
-              notify={notify}
-            />
-          </div>
+            <div className="min-h-0 min-w-0 flex-1">
+              {view === "explorer" ? (
+                <Explorer initialRoot={settings.defaultDir ?? ""} notify={notify} />
+              ) : view === "github" ? (
+                <GithubPage
+                  notify={notify}
+                  defaultDir={settings.defaultDir}
+                  localNames={localNames}
+                  onCloned={handleCreated}
+                />
+              ) : (
+                <Dashboard
+                  projects={projects}
+                  scanning={scanning}
+                  narrow={!!inspected}
+                  folders={folders}
+                  assignments={assignments}
+                  selectedFolder={selectedFolder}
+                  explainingId={explainingId}
+                  onNewProject={() => setWizardOpen(true)}
+                  onScanFolder={handleScanFolder}
+                  onProceedToCode={handleProceedToCode}
+                  onPreview={handlePreview}
+                  onReveal={handleReveal}
+                  onDelete={requestDelete}
+                  onAssignFolder={assignFolder}
+                  onEdit={setEditingProject}
+                  onExplain={handleExplain}
+                  onSelect={setInspectProject}
+                />
+              )}
+            </div>
+            {inspected && view === "dashboard" && (
+              <div className="min-h-0 w-[34%] min-w-[20rem] max-w-[40rem] shrink-0 animate-slide-in-right">
+                <ProjectPanel
+                  project={inspected}
+                  onClose={() => setInspectProject(null)}
+                  onOpenInEditor={handleProceedToCode}
+                  onExpand={(p) => setExpandedId(p.id)}
+                  notify={notify}
+                />
+              </div>
+            )}
+          </>
         )}
       </div>
 

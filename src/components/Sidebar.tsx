@@ -5,6 +5,7 @@ import {
   CompassIcon,
   FolderIcon,
   FolderPlusIcon,
+  GithubIcon,
   LayersIcon,
   PencilIcon,
   TrashIcon,
@@ -12,7 +13,13 @@ import {
 } from "./icons";
 
 export type FolderSelection = "all" | "unfiled" | string;
-export type ViewMode = "dashboard" | "explorer";
+export type ViewMode = "dashboard" | "explorer" | "github";
+
+const NAV_ITEMS: { id: ViewMode; label: string; icon: React.ReactNode }[] = [
+  { id: "dashboard", label: "Dashboard", icon: <LayersIcon className="h-4 w-4" /> },
+  { id: "explorer", label: "Explorer", icon: <CompassIcon className="h-4 w-4" /> },
+  { id: "github", label: "GitHub", icon: <GithubIcon className="h-4 w-4" /> },
+];
 
 interface Props {
   view: ViewMode;
@@ -58,26 +65,28 @@ export default function Sidebar({
 
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-surface-border bg-surface-base/60">
-      {/* View switch */}
-      <div className="flex items-center gap-1 border-b border-surface-border p-2">
-        <ViewTab
-          active={view === "dashboard"}
-          icon={<LayersIcon className="h-4 w-4" />}
-          label="Dashboard"
-          onClick={() => onView("dashboard")}
-        />
-        <ViewTab
-          active={view === "explorer"}
-          icon={<CompassIcon className="h-4 w-4" />}
-          label="Explorer"
-          onClick={() => onView("explorer")}
-        />
-      </div>
+      {/* Primary navigation */}
+      <nav className="space-y-0.5 border-b border-surface-border p-2">
+        {NAV_ITEMS.map((item) => (
+          <NavItem
+            key={item.id}
+            active={view === item.id}
+            icon={item.icon}
+            label={item.label}
+            onClick={() => onView(item.id)}
+          />
+        ))}
+      </nav>
 
       {view === "explorer" ? (
         <div className="flex-1 px-3 py-4 text-xs leading-relaxed text-slate-500">
           Browse your files like a finder. Read-only — nothing is moved or
           changed.
+        </div>
+      ) : view === "github" ? (
+        <div className="flex-1 px-3 py-4 text-xs leading-relaxed text-slate-500">
+          Browse every repository you can access and save any of them to your
+          machine.
         </div>
       ) : (
         <>
@@ -209,7 +218,7 @@ export default function Sidebar({
   );
 }
 
-function ViewTab({
+function NavItem({
   active,
   icon,
   label,
@@ -223,13 +232,13 @@ function ViewTab({
   return (
     <button
       onClick={onClick}
-      className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium transition-colors ${
+      className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm font-medium transition-colors ${
         active
           ? "bg-accent/15 text-accent-soft"
           : "text-slate-400 hover:bg-surface-hover hover:text-slate-200"
       }`}
     >
-      {icon}
+      <span className={active ? "text-accent-soft" : "text-slate-500"}>{icon}</span>
       {label}
     </button>
   );

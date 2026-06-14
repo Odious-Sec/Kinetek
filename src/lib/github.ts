@@ -13,6 +13,31 @@ export interface GithubRepo {
   name: string;
   cloneUrl: string;
   private: boolean;
+  description: string | null;
+  language: string | null;
+  /** ISO timestamp of the last push. */
+  updatedAt: string | null;
+  /** GitHub web URL, for "open on GitHub". */
+  htmlUrl: string;
+  defaultBranch: string;
+  stars: number;
+  fork: boolean;
+}
+
+function toRepo(r: Record<string, unknown>): GithubRepo {
+  return {
+    fullName: String(r.full_name),
+    name: String(r.name),
+    cloneUrl: String(r.clone_url),
+    private: !!r.private,
+    description: (r.description as string) ?? null,
+    language: (r.language as string) ?? null,
+    updatedAt: (r.pushed_at as string) ?? (r.updated_at as string) ?? null,
+    htmlUrl: String(r.html_url ?? ""),
+    defaultBranch: String(r.default_branch ?? "main"),
+    stars: Number(r.stargazers_count ?? 0),
+    fork: !!r.fork,
+  };
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -75,12 +100,27 @@ export async function listGithubRepos(token: string): Promise<GithubRepo[]> {
     token,
     "/user/repos?per_page=100&sort=updated&affiliation=owner"
   );
-  return (data as Record<string, unknown>[]).map((r) => ({
-    fullName: String(r.full_name),
-    name: String(r.name),
-    cloneUrl: String(r.clone_url),
-    private: !!r.private,
-  }));
+  return (data as Record<string, unknown>[]).map(toRepo);
+}
+
+/**
+ * EVERY repo the user can access (owner + collaborator + org member), paginated
+ * to completion. Most-recently-pushed first. Used by the GitHub page.
+ */
+export async function listAllGithubRepos(token: string): Promise<GithubRepo[]> {
+  const all: GithubRepo[] = [];
+  // Cap at 10 pages (1000 repos) to stay responsive.
+  for (let page = 1; page <= 10; page++) {
+    const data = (await gh(
+      token,
+      `/user/repos?per_page=100&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`
+    )) as Record<string, unknown>[];
+    all.push(...data.map(toRepo));
+    if (data.length < 100) break;
+  }
+  // De-dupe by full name (orgs can surface twice) and keep push order.
+  const seen = new Set<string>();
+  return all.filter((r) => (seen.has(r.fullName) ? false : (seen.add(r.fullName), true)));
 }
 
 /** Create a new repo under the authenticated account (empty, no auto-init). */
@@ -93,10 +133,5 @@ export async function createGithubRepo(
     method: "POST",
     body: JSON.stringify({ name, private: isPrivate, auto_init: false }),
   });
-  return {
-    fullName: String(r.full_name),
-    name: String(r.name),
-    cloneUrl: String(r.clone_url),
-    private: !!r.private,
-  };
+  return toRepo(r);
 }

@@ -20,6 +20,7 @@ import type {
   Prerequisite,
   PreviewInfo,
   PreviewStatus,
+  Commit,
   Project,
   ProjectContext,
   SearchHit,
@@ -182,6 +183,23 @@ export async function gitInit(path: string): Promise<void> {
 /** Point the project's `origin` remote at a repo URL. */
 export async function gitSetRemote(path: string, url: string): Promise<void> {
   return invoke("git_set_remote", { path, url });
+}
+
+/** Read the commit history (all branches) for the visual graph. */
+export async function gitLog(path: string, limit?: number): Promise<Commit[]> {
+  return invoke<Commit[]>("git_log", { path, limit });
+}
+
+/**
+ * Clone a GitHub repo into `dest` (a parent folder). Returns a project card for
+ * the cloned folder. The token is used only for transport and is never saved.
+ */
+export async function gitClone(
+  url: string,
+  dest: string,
+  token: string
+): Promise<Project> {
+  return invoke<Project>("git_clone", { url, dest, token });
 }
 
 /** Open a project in the chosen editor ("vscode" | "cursor" | "zed" | "finder"). */

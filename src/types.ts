@@ -114,6 +114,24 @@ export interface GitStatus {
   lastCommitRelative: string | null;
 }
 
+/** One commit in the history, for the visual graph (mirrors Rust). */
+export interface Commit {
+  hash: string;
+  shortHash: string;
+  /** Parent hashes (first = mainline). Merge commits have 2+. */
+  parents: string[];
+  /** Branch / tag names decorating this commit. */
+  refs: string[];
+  /** Whether HEAD points at this commit. */
+  isHead: boolean;
+  author: string;
+  email: string;
+  dateIso: string;
+  dateRelative: string;
+  subject: string;
+  body: string;
+}
+
 /** A directory entry for the visual file Explorer (mirrors Rust). */
 export interface DirEntry {
   name: string;

@@ -5,6 +5,12 @@
 > tells you what Kinetek is, how it's built, where things live, the conventions
 > you must follow, and the traps that have already bitten us. Trust it, but if it
 > ever contradicts the code, the code wins — fix this file when that happens.
+>
+> **Need more than the map?** This file is the overview. For exact backend
+> command signatures, struct⇄type tables, step-by-step flows, the commit-graph
+> algorithm, GitHub/AI internals, and a conventions checklist, open
+> **[`PROJECT.md`](./PROJECT.md)** — the detailed companion reference. Read it
+> when you're about to work on a subsystem; you don't need it just to orient.
 
 ## What Kinetek is
 

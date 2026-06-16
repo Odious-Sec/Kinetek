@@ -207,15 +207,16 @@ export default function App() {
     [notify, settings.defaultEditor]
   );
 
-  // Open an arbitrary path (project root, a part folder, or a file) in the editor.
+  // Open a folder (project root or a part) in the editor, optionally focusing a
+  // file — so "open this file" opens its part as the workspace with the file open.
   const handleOpenPath = useCallback(
-    async (path: string) => {
+    async (path: string, file?: string) => {
       if (!isTauri()) {
         notify("err", "Opening an editor is only available in the desktop app.");
         return;
       }
       try {
-        await openInEditor(path, settings.defaultEditor);
+        await openInEditor(path, settings.defaultEditor, file);
         notify("ok", `Opening in ${settings.defaultEditor}…`);
       } catch (e) {
         notify("err", typeof e === "string" ? e : String(e));
@@ -388,6 +389,7 @@ export default function App() {
               setView("projects");
             }}
             onOpenPath={handleOpenPath}
+            onPreview={setPreviewProject}
             notify={notify}
           />
         ) : (

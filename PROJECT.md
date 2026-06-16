@@ -204,6 +204,11 @@ the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params
   indentation) and Go (`gofmt -e`, parses → `file:line:col`). Returns `[]` when
   fine, Monaco-handled (js/ts/json/css/html), or the tool is missing — never
   blocks saving. `Diagnostic{line,column,message,severity}`.
+- `detect_endpoints(path) -> Vec<Endpoint>` — heuristic route scan (the `regex`
+  crate, `EndpointPatterns`/`scan_endpoints` walking the API folder, ≤1500 files)
+  for Express/Fastify, NestJS decorators, FastAPI, Flask, ASP.NET ([Http*] +
+  minimal-API .Map*), and Go (net/http/gin/chi). `Endpoint{method,route,file,line}`.
+  Powers `ApiPanel`. Not a real parser — best-effort surface map.
 - `read_file_text(path) -> FileContent` — UTF-8 only; flags `binary`,
   `tooLarge`, `truncated`; caps ~2MB / 400k chars.
 - `search_files(root, query) -> Vec<SearchHit>` — recursive, case-insensitive
@@ -247,6 +252,7 @@ The TS mirrors live in `src/types.ts`. Keep them in lockstep by hand.
 | `DirEntryInfo`    | `DirEntry`       | name, path, isDir, hidden |
 | `FileContent`     | `FileContent`    | content, truncated, binary, tooLarge, size |
 | `Diagnostic`      | `Diagnostic`     | line, column, message, severity |
+| `Endpoint`        | `Endpoint`       | method, route, file, line |
 | `SearchHit`       | `SearchHit`      | name, path, isDir, rel |
 
 `ProjectStatus` (TS only, the `status` string): `"Live" | "In Development" | "On Hold"`.
@@ -291,8 +297,11 @@ Frontend-only types (no Rust mirror): `Template` (now with `kinds: AppKind[]`,
   (`readDir` on the root) and shows a part switcher that re-roots `FileBrowser`
   (keyed so it remounts) for instant App/API/Database browsing; clicking a file
   opens it in the lazy **Monaco `CodeEditor`** (edit + ⌘S save + diagnostics).
-  **Proceed to IDE** is a split button → `onOpenPath` (App's `handleOpenPath` →
-  `openInEditor`) for the whole project, the active part folder, or the file.
+  **Proceed to IDE** is a split button → `onOpenPath(path, file?)` (App's
+  `handleOpenPath` → `openInEditor(path, editor, file)`): whole project, the active
+  part folder, or **"Open this file"** = the part folder as workspace + the file
+  focused (`code <folder> <file>`). A **Preview** button → `onPreview` opens
+  `PreviewDialog` for the `app/` part (assembled) or the root (flat).
 - Dialog/transient flags: `wizardOpen`, `pendingDelete`, `pendingInstall`,
   `editingProject`, `settingsOpen`, `explainingId`, `scanning`, toasts.
 

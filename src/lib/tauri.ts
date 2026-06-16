@@ -22,6 +22,7 @@ import type {
   PreviewStatus,
   Commit,
   Diagnostic,
+  Endpoint,
   GitRefs,
   Project,
   ProjectContext,
@@ -317,9 +318,16 @@ export async function gitStashDrop(path: string, index: number): Promise<void> {
   return invoke("git_stash_drop", { path, index });
 }
 
-/** Open a project in the chosen editor ("vscode" | "cursor" | "zed" | "finder"). */
-export async function openInEditor(path: string, editor: string): Promise<void> {
-  return invoke("open_in_editor", { path, editor });
+/**
+ * Open a project in the chosen editor ("vscode" | "cursor" | "zed" | "finder").
+ * When `file` is given, `path` opens as the workspace and `file` is focused.
+ */
+export async function openInEditor(
+  path: string,
+  editor: string,
+  file?: string
+): Promise<void> {
+  return invoke("open_in_editor", { path, editor, file });
 }
 
 /** List a folder's children for the visual Explorer (folders first). */
@@ -346,6 +354,11 @@ export async function writeFileText(path: string, content: string): Promise<void
 /** On-save syntax check (Python/Go); empty when fine or unhandled by the backend. */
 export async function checkSyntax(path: string): Promise<Diagnostic[]> {
   return invoke<Diagnostic[]>("check_syntax", { path });
+}
+
+/** Heuristically detect the HTTP routes an API exposes (for the API explorer). */
+export async function detectEndpoints(path: string): Promise<Endpoint[]> {
+  return invoke<Endpoint[]>("detect_endpoints", { path });
 }
 
 /** Recursively find files/folders under root whose name matches the query. */

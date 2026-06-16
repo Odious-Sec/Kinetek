@@ -203,6 +203,15 @@ export interface SearchHit {
   rel: string;
 }
 
+/** A detected API route for the endpoint explorer (mirrors Rust). */
+export interface Endpoint {
+  method: string;
+  route: string;
+  /** Path relative to the scanned API folder. */
+  file: string;
+  line: number;
+}
+
 /** An editor syntax diagnostic from the backend on-save check (mirrors Rust). */
 export interface Diagnostic {
   line: number;

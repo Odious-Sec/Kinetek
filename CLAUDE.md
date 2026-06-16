@@ -146,12 +146,17 @@ Both must be clean before you call something done. For a shippable bundle:
   `components/wizard/` + wire it into the orchestrator's body/footer + `Phase`.
 - `ProjectPage.tsx` — **full-page** project view (replaces the whole content
   area), reached by selecting a project. A **breadcrumb** (`Projects › <name>`)
-  navigates back. Tabs: Overview / Files / History / Source control. The **Files**
+  navigates back. Tabs: Overview / Files / (API, when an `api/` part exists) /
+  History / Source control (Overview is full-width; header actions pinned right).
+  The **Files**
   tab is an **IDE-style editor**: an **App / API / Database** part switcher (for
   assembled projects) re-roots the tree to `app/`/`api/`/`database/`, and clicking
   a file opens it in the **Monaco `CodeEditor`** — edit + save with live syntax
-  diagnostics. Header has a split **Proceed to IDE** (whole project, or the
-  active part folder / current file via its ▾ menu).
+  diagnostics. Header has a split **Proceed to IDE** (▾ menu: whole project, the
+  active part folder, or **"Open this file"** = opens the part folder as the
+  workspace *with the file focused* via `open_in_editor(folder, editor, file)`),
+  plus a **Preview** button (previews the `app/` part for assembled projects, else
+  the root, through `PreviewDialog`).
   The Source-control tab is a **two-pane git workspace**: `GitPanel` on the left,
   a `DiffViewer` of the selected change filling the rest (uses the full width).
   The History tab is `RefsSidebar` (branches/remotes/tags/stashes) + `CommitGraph`.
@@ -192,13 +197,20 @@ Both must be clean before you call something done. For a shippable bundle:
   the **Terminal** sidebar page. **Lazy-loaded** (`React.lazy` in `App.tsx`) so
   xterm (~294 kB) is a separate chunk that only loads when opened. Streams bytes
   both ways; fits/resizes via `ResizeObserver` + `FitAddon`.
+- `ApiPanel.tsx` — the **API explorer** (a `ProjectPage` tab shown when the
+  project has an `api/` part): lists detected routes (method · path · file:line)
+  from `detect_endpoints`, filterable, click a row → opens the file in the editor.
+  Heuristic, framework-agnostic. First step toward a request tester.
 - `ClaudePanel.tsx` — the **Claude Code** right-dock panel in `ProjectPage`
   (toggled from the header, resizable): delegates a
   prompt to the installed `claude` CLI in the project dir, injecting a Kinetek
   state snapshot (project + live git status/changes) so the agent knows what the
   user is looking at. Streams output live; Plan vs Auto-edit mode. Shows an
   install hint if `claude` isn't found (`check_tool`). Output is rendered with
-  `Markdown.tsx` (highlighted code, headings, lists) — not raw terminal text.
+  `Markdown.tsx` (highlighted code, headings, lists) — not raw terminal text. Has
+  a **"Generate context docs"** action (`DOCS_PROMPT`, forces `acceptEdits`):
+  Claude Code writes `CLAUDE.md` + `README.md` into `app/`, `api/`, and the root
+  (skipping absent parts) so there's context before opening the IDE.
 - `RefsSidebar.tsx` — our-style (NOT Fork's) refs panel: collapsible
   Branches/Remotes/Tags/Stashes with create-branch, checkout, delete-branch, and
   stash save/apply/pop/drop. Lives in `ProjectPage`'s History tab beside the
@@ -260,9 +272,12 @@ One file, grouped by feature. Command catalog (all registered in
 - **Files:** `read_dir`, `read_file_text` (UTF-8, flags binary/tooLarge/
   truncated), `write_file_text` (in-app editor save), `check_syntax(path)`
   (on-save diagnostics — Python via `py_compile`, Go via `gofmt -e`; `[]` for
-  Monaco-handled or unsupported langs), `search_files`, `home_dir`.
-- **Open externally:** `open_in_editor` (vscode/cursor/zed/finder),
-  `open_in_vscode`, `open_in_file_manager`, `log_error`.
+  Monaco-handled or unsupported langs), `detect_endpoints(path)` (heuristic
+  route scan via `regex` for the API explorer — Express/Nest/FastAPI/Flask/
+  ASP.NET/Go → `Endpoint{method,route,file,line}`), `search_files`, `home_dir`.
+- **Open externally:** `open_in_editor(path, editor, file?)` (vscode/cursor/zed/
+  finder; `file` opens `path` as the workspace AND focuses that file —
+  `code <folder> <file>`), `open_in_vscode`, `open_in_file_manager`, `log_error`.
 
 ## Feature notes worth knowing
 

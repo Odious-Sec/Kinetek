@@ -18,8 +18,23 @@ import {
   ExternalLinkIcon,
   PlayIcon,
   RefreshIcon,
+  SparkIcon,
   XIcon,
 } from "./icons";
+
+/** Preset prompt: generate context docs (CLAUDE.md + README) per part + root. */
+const DOCS_PROMPT = `Create context documentation for this project so a developer or an AI agent has full context BEFORE opening it in an IDE.
+
+For the project root, and for each of these subfolders that actually exists — \`app/\` and \`api/\` — write BOTH files:
+- \`CLAUDE.md\`: concise, agent-oriented context — what this part is, its tech stack, how it's structured, how to run/build/test it, and the key files/entry points. Write it the way a senior engineer would brief an AI agent picking up the code.
+- \`README.md\`: a clear, human-readable version of the same.
+
+Rules:
+- Inspect the ACTUAL files first — describe what's really there, don't invent or assume.
+- Skip a subfolder if it doesn't exist (e.g. no \`api/\` → no api docs).
+- The root \`CLAUDE.md\`/\`README.md\` should tie the parts together: what the whole project is and how app / api / database relate.
+- Only CREATE or overwrite these Markdown files — do not modify any source code.
+- Keep each file focused and accurate.`;
 
 interface Props {
   project: Project;
@@ -165,8 +180,8 @@ export default function ClaudePanel({ project, notify }: Props) {
     unlistenRef.current = [];
   }
 
-  async function run() {
-    if (!prompt.trim() || running) return;
+  async function run(promptText: string = prompt, runMode: ClaudeMode = mode) {
+    if (!promptText.trim() || running) return;
     const id = `claude-${Date.now()}`;
     runIdRef.current = id;
     setLines([]);
@@ -183,8 +198,8 @@ export default function ClaudePanel({ project, notify }: Props) {
 
     try {
       const snapshot = await buildSnapshot(project);
-      const full = `${snapshot}\n\n${prompt.trim()}`;
-      await runClaudeAgent(id, project.path, full, mode);
+      const full = `${snapshot}\n\n${promptText.trim()}`;
+      await runClaudeAgent(id, project.path, full, runMode);
       notify("ok", "Claude Code finished.");
     } catch (e) {
       notify("err", typeof e === "string" ? e : String(e));
@@ -192,6 +207,15 @@ export default function ClaudePanel({ project, notify }: Props) {
       setRunning(false);
       cleanupListeners();
     }
+  }
+
+  // One-click: have Claude Code write context docs for each part, so there's
+  // context ready before opening the IDE. Forces auto-edit (it writes files).
+  function runDocs() {
+    if (running) return;
+    setPrompt(DOCS_PROMPT);
+    setMode("acceptEdits");
+    void run(DOCS_PROMPT, "acceptEdits");
   }
 
   async function stop() {
@@ -269,6 +293,16 @@ export default function ClaudePanel({ project, notify }: Props) {
           placeholder="Ask Claude Code to do something in this project — e.g. “add input validation to the signup form” or “explain how auth works”."
           className="w-full resize-y rounded-lg border border-surface-border bg-surface-base px-3 py-2 text-sm text-slate-100 outline-none transition-colors placeholder:text-slate-600 focus:border-accent/60 disabled:opacity-60"
         />
+        <button
+          onClick={runDocs}
+          disabled={running}
+          title="Have Claude Code write CLAUDE.md + README for app / api / root"
+          className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent-soft transition-colors hover:bg-accent/15 disabled:opacity-50"
+        >
+          <SparkIcon className="h-3.5 w-3.5" />
+          Generate context docs
+          <span className="text-slate-500">CLAUDE.md + README · app · api · root</span>
+        </button>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {/* Mode */}
           <div className="flex items-center gap-1">
@@ -298,7 +332,7 @@ export default function ClaudePanel({ project, notify }: Props) {
               </button>
             ) : null}
             <button
-              onClick={run}
+              onClick={() => run()}
               disabled={running || !prompt.trim()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-glow disabled:cursor-not-allowed disabled:opacity-40"
             >

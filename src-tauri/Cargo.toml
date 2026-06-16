@@ -29,6 +29,8 @@ trash = "5"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 # Real PTY for the in-app interactive terminal (so prompts/colors/TUIs work).
 portable-pty = "0.8"
+# Heuristic route parsing for the API endpoint explorer.
+regex = "1"
 
 # Unix-only: signal a dev server's whole process group when stopping a preview.
 [target.'cfg(unix)'.dependencies]

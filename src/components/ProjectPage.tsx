@@ -7,17 +7,20 @@ import RefsSidebar from "./RefsSidebar";
 import GitPanel from "./GitPanel";
 import DiffViewer from "./DiffViewer";
 import ClaudePanel from "./ClaudePanel";
+import ApiPanel from "./ApiPanel";
 import StatusBadge from "./StatusBadge";
 import {
   BotIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CodeIcon,
+  EyeIcon,
   FileIcon,
   FolderIcon,
   GitBranchIcon,
   GitCommitIcon,
   InfoIcon,
+  ServerIcon,
   TerminalIcon,
   XIcon,
 } from "./icons";
@@ -37,13 +40,15 @@ interface ProjectPart {
   path: string;
 }
 
-type Tab = "overview" | "files" | "history" | "git";
+type Tab = "overview" | "files" | "api" | "history" | "git";
 
 interface Props {
   project: Project;
   onBack: () => void;
-  /** Open any path (project root, a part folder, or a file) in the editor. */
-  onOpenPath: (path: string) => void;
+  /** Open a folder (root/part) in the editor, optionally focusing a file. */
+  onOpenPath: (path: string, file?: string) => void;
+  /** Open the preview dialog for a (possibly sub-path) project. */
+  onPreview: (project: Project) => void;
   notify: (kind: "ok" | "err", message: string) => void;
 }
 
@@ -52,7 +57,7 @@ interface Props {
  * overview, a wide file browser + source viewer, the commit graph, and source
  * control. Reached via the "expand" button on the side inspector.
  */
-export default function ProjectPage({ project, onBack, onOpenPath, notify }: Props) {
+export default function ProjectPage({ project, onBack, onOpenPath, onPreview, notify }: Props) {
   const [tab, setTab] = useState<Tab>("overview");
   const [ideMenuOpen, setIdeMenuOpen] = useState(false);
   const [showHidden, setShowHidden] = useState(false);
@@ -141,15 +146,26 @@ export default function ProjectPage({ project, onBack, onOpenPath, notify }: Pro
 
   const activePart = parts.find((p) => p.path === filePartPath) ?? null;
 
+  // Preview targets the frontend: the `app/` part for assembled projects, else
+  // the project root. (PreviewDialog auto-detects web/static/.NET on that path.)
+  const appPart = parts.find((p) => p.name === "app");
+  const apiPart = parts.find((p) => p.name === "api");
+  const previewTarget: Project = appPart
+    ? { ...project, path: appPart.path, name: `${project.name} · app` }
+    : project;
+
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "overview", label: "Overview", icon: <InfoIcon className="h-4 w-4" /> },
     { id: "files", label: "Files", icon: <FileIcon className="h-4 w-4" /> },
+    ...(apiPart
+      ? [{ id: "api" as Tab, label: "API", icon: <ServerIcon className="h-4 w-4" /> }]
+      : []),
     { id: "history", label: "History", icon: <GitCommitIcon className="h-4 w-4" /> },
     { id: "git", label: "Source control", icon: <GitBranchIcon className="h-4 w-4" /> },
   ];
 
   return (
-    <div className="flex h-full flex-col bg-surface-base">
+    <div className="flex h-full min-w-0 flex-1 flex-col bg-surface-base">
       {/* Header */}
       <div className="shrink-0 border-b border-surface-border px-5 py-3">
         {/* Breadcrumb */}
@@ -233,7 +249,9 @@ export default function ProjectPage({ project, onBack, onOpenPath, notify }: Pro
                         label="Open this file"
                         sub={selected.name}
                         onClick={() => {
-                          onOpenPath(selected.path);
+                          // Open the part folder (or project) as the workspace,
+                          // with this file focused.
+                          onOpenPath(activePart?.path ?? project.path, selected.path);
                           setIdeMenuOpen(false);
                         }}
                       />
@@ -242,6 +260,14 @@ export default function ProjectPage({ project, onBack, onOpenPath, notify }: Pro
                 </>
               )}
             </div>
+            <button
+              onClick={() => onPreview(previewTarget)}
+              title="Run a live preview of the app"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-surface-hover"
+            >
+              <EyeIcon className="h-3.5 w-3.5" />
+              Preview
+            </button>
             <button
               onClick={() =>
                 reveal({ name: project.name, path: project.path, isDir: true, hidden: false })
@@ -348,6 +374,14 @@ export default function ProjectPage({ project, onBack, onOpenPath, notify }: Pro
               )}
             </div>
           </div>
+        )}
+
+        {tab === "api" && apiPart && (
+          <ApiPanel
+            path={apiPart.path}
+            onOpenFile={(rel) => onOpenPath(apiPart.path, `${apiPart.path}/${rel}`)}
+            notify={notify}
+          />
         )}
 
         {tab === "history" && (
@@ -518,7 +552,7 @@ function Overview({ project }: { project: Project }) {
   }, [project.path]);
 
   return (
-    <div className="mx-auto max-w-3xl p-6">
+    <div className="p-6">
       <section className="rounded-2xl border border-surface-border bg-surface-card p-5">
         <h2 className="text-[11px] font-semibold uppercase tracking-wider text-slate-600">
           Summary

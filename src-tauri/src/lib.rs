@@ -19,6 +19,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
@@ -3329,6 +3330,164 @@ fn check_go(p: &Path) -> Vec<Diagnostic> {
     diags
 }
 
+/// One detected HTTP route in an API (best-effort, not a real parser).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Endpoint {
+    pub method: String,
+    pub route: String,
+    /// Path relative to the scanned API folder.
+    pub file: String,
+    pub line: u32,
+}
+
+/// Compiled route patterns for the supported API frameworks.
+struct EndpointPatterns {
+    js_route: Regex, // express/fastify: app.get('/x')   → g1 method, g2 route
+    nest: Regex,     // NestJS decorators: @Get('x')     → g1 method, g2 route?
+    py_dec: Regex,   // FastAPI: @app.get("/x")          → g1 method, g2 route
+    py_route: Regex, // Flask: @app.route("/x")          → g1 route (method ANY)
+    cs_attr: Regex,  // ASP.NET: [HttpGet("x")]          → g1 method, g2 route?
+    cs_map: Regex,   // minimal API: .MapGet("/x", …)    → g1 method, g2 route
+    go_route: Regex, // net/http + gin/chi: .GET("/x")   → g1 verb, g2 route
+}
+
+impl EndpointPatterns {
+    fn new() -> Self {
+        EndpointPatterns {
+            js_route: Regex::new(r#"(?i)\b(?:app|router|api|server|route)\.(get|post|put|patch|delete|all|options|head)\s*\(\s*["']([^"']+)"#).unwrap(),
+            nest: Regex::new(r#"@(Get|Post|Put|Patch|Delete|All)\s*\(\s*["']?([^"')]*)"#).unwrap(),
+            py_dec: Regex::new(r#"(?i)@\w+\.(get|post|put|patch|delete)\s*\(\s*["']([^"']+)"#).unwrap(),
+            py_route: Regex::new(r#"@\w+\.route\s*\(\s*["']([^"']+)"#).unwrap(),
+            cs_attr: Regex::new(r#"\[Http(Get|Post|Put|Patch|Delete)(?:\s*\(\s*"([^"]*)"\s*\))?\]"#).unwrap(),
+            cs_map: Regex::new(r#"(?i)\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*"([^"]+)""#).unwrap(),
+            go_route: Regex::new(r#"(?i)\.(HandleFunc|GET|POST|PUT|PATCH|DELETE)\s*\(\s*"([^"]+)""#).unwrap(),
+        }
+    }
+
+    fn scan_line(&self, ext: &str, line: &str, lineno: u32, rel: &str, out: &mut Vec<Endpoint>) {
+        let mut push = |method: &str, route: &str| {
+            out.push(Endpoint {
+                method: method.to_uppercase(),
+                route: if route.trim().is_empty() { "/".into() } else { route.to_string() },
+                file: rel.to_string(),
+                line: lineno,
+            });
+        };
+        match ext {
+            "js" | "ts" | "jsx" | "tsx" | "mjs" | "cjs" => {
+                for c in self.js_route.captures_iter(line) {
+                    push(&c[1], &c[2]);
+                }
+                for c in self.nest.captures_iter(line) {
+                    push(&c[1], c.get(2).map(|m| m.as_str()).unwrap_or(""));
+                }
+            }
+            "py" => {
+                for c in self.py_dec.captures_iter(line) {
+                    push(&c[1], &c[2]);
+                }
+                for c in self.py_route.captures_iter(line) {
+                    push("ANY", &c[1]);
+                }
+            }
+            "cs" => {
+                for c in self.cs_attr.captures_iter(line) {
+                    push(&c[1], c.get(2).map(|m| m.as_str()).unwrap_or(""));
+                }
+                for c in self.cs_map.captures_iter(line) {
+                    push(&c[1], &c[2]);
+                }
+            }
+            "go" => {
+                for c in self.go_route.captures_iter(line) {
+                    let verb = &c[1];
+                    let method = if verb.eq_ignore_ascii_case("HandleFunc") { "ANY" } else { verb };
+                    push(method, &c[2]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_endpoints(
+    root: &Path,
+    dir: &Path,
+    pats: &EndpointPatterns,
+    out: &mut Vec<Endpoint>,
+    files: &mut usize,
+) {
+    if *files > 1500 {
+        return;
+    }
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if SEARCH_SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            scan_endpoints(root, &p, pats, out, files);
+        } else {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "js" | "ts" | "jsx" | "tsx" | "mjs" | "cjs" | "py" | "cs" | "go")
+            {
+                continue;
+            }
+            *files += 1;
+            if *files > 1500 {
+                return;
+            }
+            let content = match fs::read_to_string(&p) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if content.len() > 600_000 {
+                continue;
+            }
+            let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+            for (i, line) in content.lines().enumerate() {
+                pats.scan_line(&ext, line, (i as u32) + 1, &rel, out);
+            }
+        }
+    }
+}
+
+/// Heuristically list the HTTP routes an API exposes (for the API explorer).
+#[tauri::command]
+async fn detect_endpoints(path: String) -> Result<Vec<Endpoint>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&path);
+        if !root.is_dir() {
+            return Err(format!("\"{}\" is not a folder.", root.display()));
+        }
+        let pats = EndpointPatterns::new();
+        let mut out: Vec<Endpoint> = Vec::new();
+        let mut files = 0usize;
+        scan_endpoints(&root, &root, &pats, &mut out, &mut files);
+        out.sort_by(|a, b| a.route.cmp(&b.route).then(a.method.cmp(&b.method)));
+        out.dedup_by(|a, b| {
+            a.method == b.method && a.route == b.route && a.file == b.file && a.line == b.line
+        });
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("The endpoint scan failed unexpectedly: {e}"))?
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
@@ -3685,6 +3844,7 @@ pub fn run() {
             read_file_text,
             write_file_text,
             check_syntax,
+            detect_endpoints,
             search_files,
             home_dir,
             open_in_editor,

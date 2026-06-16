@@ -6,19 +6,23 @@ import {
   FolderIcon,
   FolderPlusIcon,
   GithubIcon,
+  HomeIcon,
   LayersIcon,
   PencilIcon,
+  TerminalIcon,
   TrashIcon,
   XIcon,
 } from "./icons";
 
 export type FolderSelection = "all" | "unfiled" | string;
-export type ViewMode = "dashboard" | "explorer" | "github";
+export type ViewMode = "home" | "projects" | "explorer" | "github" | "terminal";
 
 const NAV_ITEMS: { id: ViewMode; label: string; icon: React.ReactNode }[] = [
-  { id: "dashboard", label: "Dashboard", icon: <LayersIcon className="h-4 w-4" /> },
+  { id: "home", label: "Dashboard", icon: <HomeIcon className="h-4 w-4" /> },
+  { id: "projects", label: "Projects", icon: <LayersIcon className="h-4 w-4" /> },
   { id: "explorer", label: "Explorer", icon: <CompassIcon className="h-4 w-4" /> },
   { id: "github", label: "GitHub", icon: <GithubIcon className="h-4 w-4" /> },
+  { id: "terminal", label: "Terminal", icon: <TerminalIcon className="h-4 w-4" /> },
 ];
 
 interface Props {
@@ -87,6 +91,18 @@ export default function Sidebar({
         <div className="flex-1 px-3 py-4 text-xs leading-relaxed text-slate-500">
           Browse every repository you can access and save any of them to your
           machine.
+        </div>
+      ) : view === "terminal" ? (
+        <div className="flex-1 px-3 py-4 text-xs leading-relaxed text-slate-500">
+          A real shell inside Kinetek. Use it to set up tools — like the{" "}
+          <span className="text-slate-300">Claude Code</span> CLI — without
+          leaving the app.
+        </div>
+      ) : view === "home" ? (
+        <div className="flex-1 px-3 py-4 text-xs leading-relaxed text-slate-500">
+          Your control center — recent work, git status at a glance, and quick
+          actions. Open <span className="text-slate-300">Projects</span> for the
+          full grid.
         </div>
       ) : (
         <>

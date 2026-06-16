@@ -85,9 +85,10 @@ Both must be clean before you call something done. For a shippable bundle:
 ### Frontend `src/`
 - `App.tsx` — the orchestrator. Holds all top-level state: `projects`,
   `folders`, `assignments`, `settings` (persisted as one `Organization`), the
-  current `view` (`"dashboard" | "explorer" | "github"`), the inspected project
-  (right panel), and `expandedId` (full-page project view). Loads the workspace
-  on mount, saves on any change (guarded by `orgLoaded`). All the handlers
+  current `view` (`"home" | "projects" | "explorer" | "github" | "terminal"`,
+  default `"home"`), and `expandedId` — **selecting a project anywhere opens the
+  full-page `ProjectPage`** (there is no side inspector anymore). Loads the
+  workspace on mount, saves on any change (guarded by `orgLoaded`). All the handlers
   (scan, create, delete, preview, explain, etc.) live here and are passed down.
 - `types.ts` — shared domain types; **mirror of the Rust structs**.
 - `index.css` — Tailwind layers + a few globals.
@@ -104,42 +105,110 @@ Both must be clean before you call something done. For a shippable bundle:
   plugin-http (Gemini generateContent, OpenAI-compatible chat/completions,
   Anthropic Messages). Returns structured JSON `{files:[{path,contents}]}`.
 - `categories.ts` — "Build by goal" categories/purposes + `composePrompt`.
-- `templates.ts` — framework templates; **ids must match `scaffold_for()` match
-  arms in lib.rs**.
+- `templates.ts` — framework templates; each has `kinds`/`platforms`/`scaffold`
+  ("cli"|"files"|"placeholder"). **ids must match `scaffold_for()` match arms in
+  lib.rs**. Web/Mobile/Desktop/API/Tool frameworks all live here.
+- `catalog.ts` — the New Project **funnel** data: `APP_CATEGORIES` (Web/Mobile/
+  Desktop + their platforms), `frameworksFor(kind, platform)`, `API_FRAMEWORKS`,
+  `DATABASES`. Add a framework = a `templates.ts` entry (+ `scaffold_for` arm);
+  the funnel picks it up automatically.
 - `logStore.ts` — `useSyncExternalStore`-backed in-app log (real-time console).
 - `sampleData.ts` — placeholder cards shown only in a plain browser (not Tauri).
 
 `src/components/` (presentational + feature panels):
 - `TitleBar.tsx` — draggable custom title bar + settings gear.
-- `Sidebar.tsx` — primary nav (`NAV_ITEMS`: Dashboard/Explorer/GitHub) +
-  virtual folders (create/rename/delete). **Add a new top-level page** by adding
-  to `NAV_ITEMS`, extending `ViewMode`, and adding a branch in App's `view`
-  switch.
-- `Dashboard.tsx` / `ProjectCard.tsx` — the project grid + cards (status chip,
-  git status chip, folder assign, edit/delete/preview/explain, click to inspect).
-- `ProjectWizard.tsx` — New Project flow (~1500 lines; all step subcomponents in
-  one file — **split into `components/wizard/` if it grows**). Two paths:
-  framework-first and goal-first; live build terminal; AI starter step.
-- `ProjectPanel.tsx` — right-side **inline** inspector (~1/3 width, not an
-  overlay) shown on the dashboard. Files | Git tabs. Has an **expand** button →
-  full-page view.
+- `Sidebar.tsx` — primary nav (`NAV_ITEMS`: Dashboard(home)/Projects/Explorer/
+  GitHub/Terminal) + virtual folders (shown only on the Projects view). **Add a
+  new top-level page** by adding to `NAV_ITEMS`, extending `ViewMode`, and adding
+  a branch in App's `view` switch.
+- `DashboardHome.tsx` — the **landing** (`view==="home"`): a registry-driven
+  **widget board**. Each entry pairs a column span with a render fn on a 6-col
+  grid; **grow the dashboard = add one entry** here + a widget under
+  `components/widgets/`. Pulls a git-status aggregate from
+  `hooks/useProjectStatuses.ts` and shares it across widgets.
+- `components/widgets/` — `Widget.tsx` (shared card chrome), `ProjectRow.tsx`
+  (shared clickable row), `QuickActionsWidget`, `StatsWidget`,
+  `RecentProjectsWidget`, `NeedsAttentionWidget`, `ActivityWidget` (reads the
+  live `logStore`). Widget project clicks open the full-page `ProjectPage`.
+- `Dashboard.tsx` / `ProjectCard.tsx` — the **Projects** grid + cards
+  (`view==="projects"`): status chip, git status chip, folder assign,
+  edit/delete/preview/explain. **Clicking a card opens the full-page
+  `ProjectPage`** (no more side inspector). Folders live on this view.
+- `ProjectWizard.tsx` — New Project flow **orchestrator**: the phase state
+  machine + shared build/preflight logic. Each phase's UI is a focused component
+  in **`components/wizard/`** (`ModeStep`, `CategoryStep`, `PurposeStep`,
+  **`AppTypeStep`**, **`PlatformStep`**, `TemplateStep`, **`StackStep`**,
+  `DetailsStep`, `PreflightStep`, `RunningStep`, `GenerateStep`, `DoneStep`,
+  `ErrorStep`). Framework path is a **funnel**: appType → (platform?) → framework
+  → **stack** (optional API + DB) → details → preflight → running. Goal path:
+  category → purpose → stack → details → … Preflight checks the **union** of
+  app+API prereqs. Live build terminal. **Add a step** = new file in
+  `components/wizard/` + wire it into the orchestrator's body/footer + `Phase`.
 - `ProjectPage.tsx` — **full-page** project view (replaces the whole content
-  area; back button returns). Tabs: Overview / Files / History / Source control.
+  area), reached by selecting a project. A **breadcrumb** (`Projects › <name>`)
+  navigates back. Tabs: Overview / Files / History / Source control. The **Files**
+  tab is an **IDE-style editor**: an **App / API / Database** part switcher (for
+  assembled projects) re-roots the tree to `app/`/`api/`/`database/`, and clicking
+  a file opens it in the **Monaco `CodeEditor`** — edit + save with live syntax
+  diagnostics. Header has a split **Proceed to IDE** (whole project, or the
+  active part folder / current file via its ▾ menu).
+  The Source-control tab is a **two-pane git workspace**: `GitPanel` on the left,
+  a `DiffViewer` of the selected change filling the rest (uses the full width).
+  The History tab is `RefsSidebar` (branches/remotes/tags/stashes) + `CommitGraph`.
+  The right side is a **persistent, resizable dock** (toggled from the header,
+  drag handle to resize) that stays put while you switch the left tabs — an
+  IDE-style split. The dock has a **Claude Code | Terminal** segmented toggle:
+  Claude Code (`ClaudePanel`) or a PTY `TerminalView` rooted at the project
+  (lazy-mounted on first open; both kept mounted so switching doesn't kill a
+  run/shell).
 - `CommitGraph.tsx` — **Fork-style commit graph** (SVG lanes/merges) for the
   History tab. See "Commit graph" below.
-- `FileBrowser.tsx` / `FileTree.tsx` / `FileViewer.tsx` — shared read-only file
-  browsing. `FileBrowser` = debounced search box wrapping the lazy recursive
-  `FileTree` (empty query → tree, query → flat results). `FileViewer` =
-  syntax-highlighted source viewer (highlight.js; HTML maps to "xml" so it shows
-  as escaped SOURCE, never rendered — the user was explicit: **no webview**).
-  Used by both Explorer and the project views.
+- `Markdown.tsx` — tiny dependency-free Markdown renderer (headings, lists,
+  blockquotes, rules, **bold**, links, inline + fenced code highlighted via
+  highlight.js). Renders real React nodes (safe). Used to make Claude Code output
+  look clean (not raw terminal text).
+- `FileBrowser.tsx` / `FileTree.tsx` — shared file browsing. `FileBrowser` =
+  debounced search box wrapping the lazy recursive `FileTree` (empty query →
+  tree, query → flat results). Used by Explorer and `ProjectPage`'s Files tab.
+- `CodeEditor.tsx` — **in-app code editor** (Monaco), **lazy-loaded** (its own
+  ~3.3 MB chunk; only loads when a file is opened). Edit + **Save** (⌘S, dirty
+  dot) real files via `write_file_text`. **Live diagnostics**: Monaco's built-in
+  language services for JS/TS/JSON/CSS/HTML; for Python/Go an **on-save backend
+  check** (`check_syntax`) is surfaced as Monaco markers (same squiggles). Monaco
+  workers + bundled loader + the `kinetek` dark theme are set up in
+  `src/lib/monaco.ts` (kept in the lazy chunk; needs `worker-src`/`font-src` in
+  the Tauri CSP). Replaced the old read-only `FileViewer` (deleted).
 - `Explorer.tsx` — read-only disk file finder (the "Kinetek as a visual file
   tree" view).
 - `GithubPage.tsx` — the GitHub page: browse **every** accessible repo + **save
   locally** (clone). See "GitHub" below.
 - `GitPanel.tsx` — per-project source control + GitHub account connect
-  (commit/push, link/create repo).
+  (commit/push, link/create repo, **public/private toggle**, **delete the GitHub
+  repo while keeping local files**). Changed files are clickable when given
+  `onSelectChange` (drives the diff pane in `ProjectPage`).
+- `DiffViewer.tsx` — coloured unified diff of local changes (`git_diff`); used in
+  `ProjectPage`'s Source-control tab to show what changed vs the last commit.
+- `TerminalView.tsx` — a real interactive terminal (xterm.js + the PTY backend),
+  the **Terminal** sidebar page. **Lazy-loaded** (`React.lazy` in `App.tsx`) so
+  xterm (~294 kB) is a separate chunk that only loads when opened. Streams bytes
+  both ways; fits/resizes via `ResizeObserver` + `FitAddon`.
+- `ClaudePanel.tsx` — the **Claude Code** right-dock panel in `ProjectPage`
+  (toggled from the header, resizable): delegates a
+  prompt to the installed `claude` CLI in the project dir, injecting a Kinetek
+  state snapshot (project + live git status/changes) so the agent knows what the
+  user is looking at. Streams output live; Plan vs Auto-edit mode. Shows an
+  install hint if `claude` isn't found (`check_tool`). Output is rendered with
+  `Markdown.tsx` (highlighted code, headings, lists) — not raw terminal text.
+- `RefsSidebar.tsx` — our-style (NOT Fork's) refs panel: collapsible
+  Branches/Remotes/Tags/Stashes with create-branch, checkout, delete-branch, and
+  stash save/apply/pop/drop. Lives in `ProjectPage`'s History tab beside the
+  graph. `CommitGraph` has a **"Create branch here"** action in its detail pane.
+  Both share a `gitRefreshKey` so a mutation in one refreshes the other.
 - `SettingsDialog.tsx` / `EditProjectDialog.tsx` / `ConfirmDialog.tsx` — dialogs.
+- `PreviewDialog.tsx` — the **single entry point for Preview**: shows the
+  detected kind, lists requirements with preview-only installs, runs it, and on
+  failure shows a friendly reason + raw dev output behind a toggle. App opens it
+  via `previewProject` state.
 - `Field.tsx` — shared labelled form field (don't re-duplicate it).
 - `StatusBadge.tsx` / `FrameworkTag.tsx` / `LogConsole.tsx` / `icons.tsx` — small
   shared UI. **All icons live in `icons.tsx`** as inline SVGs.
@@ -147,31 +216,62 @@ Both must be clean before you call something done. For a shippable bundle:
 ### Backend `src-tauri/src/lib.rs`
 One file, grouped by feature. Command catalog (all registered in
 `generate_handler!`):
-- **Projects:** `create_project` (emits `project-output` events per line for the
-  live terminal), `scan_projects`, `write_generated_files` (path-traversal
+- **Projects:** `create_project(appTemplateId, apiTemplateId?, databaseEngine?, …)`
+  — assembles an **app + optional API + optional database** into one project. Flat
+  (`parent/<name>`) when app-only; **monorepo** (`<name>/app`, `/api`, `/database`
+  + root README) when an API or DB is added. `apply_scaffold` runs each part into
+  its subfolder; `database_files(engine)` writes a placeholder (schema/.env/
+  docker-compose). Emits `project-output` per line. Returns `ProjectInfo.stack`.
+- **Projects (cont.):** `scan_projects`, `write_generated_files` (path-traversal
   guarded), `read_project_context`.
-- **Tooling:** `check_prerequisites`, `install_tool` (brew/winget).
+- **Tooling:** `check_prerequisites`, `check_tool(key)` (single tool, e.g.
+  "claude"), `install_tool` (brew/winget).
+- **Interactive terminal (PTY):** `terminal_open(id, cwd, cols, rows)` spawns the
+  user's real login shell in a PTY (`portable-pty`), streaming `terminal-output`
+  events (`{id, bytes}`) and `terminal-exit`; `terminal_write(id, data)`,
+  `terminal_resize(id, cols, rows)`, `terminal_close(id)`. Sessions tracked in
+  `TerminalState`. It's a real shell (prompts/colors/TUIs work) — e.g. to install
+  the Claude Code CLI from inside Kinetek.
+- **Claude Code delegation:** `run_claude_agent(runId, projectPath, prompt, mode)`
+  — runs the user's `claude` CLI in the project dir (`-p --output-format
+  stream-json --verbose --permission-mode`), streams `claude-output` events
+  (NDJSON parsed on the frontend so activity shows live, not buffered), ends with
+  `claude-done`; `stop_claude(runId)`
+  signals the process group. Uses the user's own Claude Code auth — no Kinetek
+  secret. `mode`: "plan" (read-only) | "acceptEdits" (can edit files).
 - **Delete:** `delete_project` (Trash via `NSFileManager`),
   `delete_project_permanently` (fallback for iCloud-evicted files).
-- **Preview:** `preview_status`, `install_deps`, `start_preview` (spawns dev
-  server, parses the printed `localhost:PORT`), `stop_preview` (`kill_tree`,
-  process-group kill on Unix).
+- **Preview:** `preview_status` (returns a `requirements[]` list + `ready`/`how`
+  for web/static/dotnet/maui — see "Preview" note below), `install_deps`,
+  `install_preview_requirement` (node/dotnet/maui workload, preview-only),
+  `start_preview` (web→dev server + `localhost:PORT`; static→file://; .NET→build
+  then launch), `stop_preview` (`kill_tree`, process-group kill on Unix).
 - **Persistence/secrets:** `load_organization`/`save_organization` (JSON in
   app **config dir**, keyed by bundle id), `set/get/delete_secret` (keychain).
 - **Git (local):** `git_status`, `git_changes`, `git_remote`, `git_commit`,
   `git_push` (token-auth HTTPS, **token scrubbed from errors**), `git_init`,
   `git_set_remote`, `git_log` (commit graph), `git_clone` (token scrubbed from
-  saved remote + errors).
+  saved remote + errors), `git_diff(path, file?)` (local changes vs HEAD;
+  untracked files synthesized as all-added), `git_remove_remote` (drop origin
+  after deleting the GitHub repo — keeps files), `git_refs` (branches/remotes/
+  tags + current), `git_create_branch(name, at?, checkout)`, `git_checkout`,
+  `git_delete_branch(name, force)`, and stashes: `git_stashes`, `git_stash_save`,
+  `git_stash_apply(index, pop)`, `git_stash_drop`.
 - **Files:** `read_dir`, `read_file_text` (UTF-8, flags binary/tooLarge/
-  truncated), `search_files`, `home_dir`.
+  truncated), `write_file_text` (in-app editor save), `check_syntax(path)`
+  (on-save diagnostics — Python via `py_compile`, Go via `gofmt -e`; `[]` for
+  Monaco-handled or unsupported langs), `search_files`, `home_dir`.
 - **Open externally:** `open_in_editor` (vscode/cursor/zed/finder),
   `open_in_vscode`, `open_in_file_manager`, `log_error`.
 
 ## Feature notes worth knowing
 
-- **Navigation:** Sidebar nav is a scalable vertical list. The right inspector
-  only renders on the dashboard view. The full-page project view (`expandedId`)
-  takes over the entire content region (sidebar included) until dismissed.
+- **Navigation:** Sidebar nav is a scalable vertical list (`home` is the default
+  landing widget board; `projects` is the grid). Folders render on the `projects`
+  view. **Selecting a project** (a card, or any dashboard widget row) sets
+  `expandedId` → the full-page `ProjectPage` takes over the entire content region
+  (sidebar included); its breadcrumb returns to `projects`. There is no side
+  inspector (it was removed in favor of this full-page navigation).
 
 - **GitHub page:** `listAllGithubRepos` paginates (per_page=100, ≤10 pages) with
   `affiliation=owner,collaborator,organization_member`, de-duped, newest-pushed
@@ -197,8 +297,35 @@ One file, grouped by feature. Command catalog (all registered in
   error text and never persisted into `.git/config` (clone resets origin to the
   clean URL afterward).
 
+- **Preview:** `preview_status` recognizes web (npm dev/start/serve), static
+  (`index.html`), and **.NET** (`.csproj`/`.sln`, with MAUI detected from the
+  csproj) and returns a `requirements[]` (each `{key,name,satisfied,detail,
+  installable,installLabel,url}`) + `ready` + `how`. `PreviewDialog` lists
+  unmet requirements with **preview-only installs** (`install_preview_requirement`
+  → node/dotnet via package manager, `maui` via `dotnet workload install maui`).
+  Running: web/static open a `WebviewWindow`; **.NET builds then launches the app
+  in its own window** (a clean build is the "it works" signal — there's no
+  webview for native). On failure, errors are packed as
+  `friendly||KINETEK_DEV||raw` (const `PREVIEW_DEV_SEP`; `splitPreviewError` in
+  `lib/tauri.ts`) so the dialog shows plain English + raw output behind a toggle;
+  `classify_dotnet_failure` maps common build errors to friendly reasons
+  ("needs the MAUI workload", "older project that needs updating", etc.).
+
 - **AI:** **BYOK only** — never embed Kinetek's own key in the binary. Keys are
   in-memory during generation but the saved ones come from the keychain.
+
+- **Claude Code (agentic coding):** the "Claude Code" tab delegates to the
+  installed `claude` CLI rather than reimplementing an agent. It runs in the
+  project dir (so the agent has project context), and Kinetek injects a
+  `<kinetek-context>` snapshot (selected project + live git status/changes) into
+  the prompt so it also knows *what the user is looking at*. Runs headless
+  (`claude -p … --permission-mode`), streaming output to the UI. **Auth is the
+  user's own Claude Code sign-in — Kinetek stores no key for this** (distinct
+  from the BYOK Anthropic API used by generate/explain). Permission modes: Plan
+  (read-only, default) vs Auto-edit (`acceptEdits`). The deeper "agent can query
+  Kinetek's live state / call its actions" path would be an **MCP server** — not
+  built. `claude` runs via a Rust `Command` (like git/dotnet), so no shell-plugin
+  capability is needed.
 
 ## Environment gotchas (these have actually burned us)
 
@@ -233,7 +360,6 @@ One file, grouped by feature. Command catalog (all registered in
 - Multi-account GitHub support.
 - Optional disk-managed folders (real `mkdir`/`mv`, permission-gated) — the
   destructive half was deliberately deferred; folders are virtual for now.
-- Splitting `ProjectWizard.tsx` into `components/wizard/`.
 
 ---
 *Keep this file current. When you add a feature or learn a new gotcha, update the

@@ -28,7 +28,22 @@ export interface Project {
   frameworks: string[];
   /** Whether the project exposes a local dev preview (heuristic). */
   hasPreview?: boolean;
+  /** Present for projects Kinetek assembled from app/API/database parts. */
+  stack?: ProjectStack;
 }
+
+/** The kind of thing a framework builds (drives the wizard funnel). */
+export type AppKind = "web" | "mobile" | "desktop" | "api" | "tool";
+
+/** A target platform a framework can produce for. */
+export type Platform =
+  | "web"
+  | "android"
+  | "ios"
+  | "windows"
+  | "macos"
+  | "linux"
+  | "cross";
 
 /** A bootstrapping template offered by the New Project wizard. */
 export interface Template {
@@ -43,6 +58,22 @@ export interface Template {
   /** The CLI tool this template drives (informational, shown to the user). */
   requires: string;
   accent: string;
+  /** Which app categories this framework serves (web/mobile/desktop/api/tool). */
+  kinds: AppKind[];
+  /** Platforms it can target (used to filter after a platform is chosen). */
+  platforms: Platform[];
+  /** How Kinetek creates it: a real CLI/file scaffold, or a guided placeholder. */
+  scaffold: "cli" | "files" | "placeholder";
+}
+
+/** The multi-part makeup of a project (mirrors Rust ProjectStack). */
+export interface ProjectStack {
+  /** App framework template id. */
+  app: string;
+  /** API framework template id, if one was added. */
+  api?: string | null;
+  /** Database engine id, if one was added. */
+  database?: string | null;
 }
 
 /** Which entry path the New Project wizard is taking. */
@@ -132,6 +163,23 @@ export interface Commit {
   body: string;
 }
 
+/** Branches / remote-tracking branches / tags for the refs sidebar (mirrors Rust). */
+export interface GitRefs {
+  /** Current branch, or "HEAD" when detached. */
+  current: string;
+  detached: boolean;
+  branches: string[];
+  /** Remote-tracking branches, e.g. "origin/main". */
+  remotes: string[];
+  tags: string[];
+}
+
+/** A saved stash entry (mirrors Rust). */
+export interface StashEntry {
+  index: number;
+  message: string;
+}
+
 /** A directory entry for the visual file Explorer (mirrors Rust). */
 export interface DirEntry {
   name: string;
@@ -155,6 +203,15 @@ export interface SearchHit {
   rel: string;
 }
 
+/** An editor syntax diagnostic from the backend on-save check (mirrors Rust). */
+export interface Diagnostic {
+  line: number;
+  column: number;
+  message: string;
+  /** "error" | "warning". */
+  severity: string;
+}
+
 /** A file's text for the read-only viewer (mirrors Rust). */
 export interface FileContent {
   content: string;
@@ -171,15 +228,35 @@ export interface ProjectContext {
   packageJson: string | null;
 }
 
+/** One thing a preview needs in order to run (mirrors Rust). */
+export interface PreviewRequirement {
+  /** Key understood by install_preview_requirement ("node" | "dotnet" | "maui"). */
+  key: string;
+  name: string;
+  satisfied: boolean;
+  /** Version when satisfied, or a hint about what's missing. */
+  detail: string;
+  /** Kinetek can install it on this machine (preview-only). */
+  installable: boolean;
+  installLabel: string;
+  url: string;
+}
+
 /** Whether/how a project can be previewed (mirrors Rust). */
 export interface PreviewStatus {
   previewable: boolean;
+  /** "web" | "static" | "dotnet" | "maui" | "unsupported" | "unknown". */
   kind: string;
+  /** "node" | "static" | "dotnet" | "none". */
   runner: string;
   script: string | null;
   needsInstall: boolean;
-  nodeInstalled: boolean;
+  requirements: PreviewRequirement[];
+  /** All requirements satisfied (and deps installed) — ready to run. */
+  ready: boolean;
   message: string;
+  /** What the preview will actually do. */
+  how: string;
 }
 
 /** A started preview: the URL to load and the id used to stop it. */
@@ -224,7 +301,12 @@ export interface Prerequisite {
 export interface CreateProjectArgs {
   parentDir: string;
   projectName: string;
-  templateId: string;
+  /** App framework template id. */
+  appTemplateId: string;
+  /** Optional API framework template id. */
+  apiTemplateId?: string | null;
+  /** Optional database engine id (e.g. "postgresql"). */
+  databaseEngine?: string | null;
   summary: string;
   status: ProjectStatus;
   frameworks: string[];

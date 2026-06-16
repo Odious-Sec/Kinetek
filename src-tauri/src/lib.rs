@@ -12,17 +12,30 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
 /// A project as rendered by a dashboard card. Serialized to camelCase so it
 /// matches the TypeScript `Project` interface in `src/types.ts`.
+/// The multi-part makeup of a project (app + optional API + optional database),
+/// recorded at creation so the dashboard and the future DB view can use it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStack {
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
@@ -34,6 +47,9 @@ pub struct ProjectInfo {
     pub frameworks: Vec<String>,
     #[serde(default)]
     pub has_preview: bool,
+    /// Present for projects Kinetek assembled from app/API/database parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<ProjectStack>,
 }
 
 /// The install/availability state of one tool a template needs.
@@ -65,21 +81,45 @@ pub struct GeneratedFile {
     pub contents: String,
 }
 
+/// One thing a preview needs in order to run (a runtime, SDK, or workload).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewRequirement {
+    /// Stable key understood by `install_preview_requirement` (e.g. "dotnet",
+    /// "node", "maui").
+    pub key: String,
+    pub name: String,
+    pub satisfied: bool,
+    /// Version when satisfied, or a hint about what's missing.
+    pub detail: String,
+    /// Kinetek can install it on this machine (a preview-only convenience).
+    pub installable: bool,
+    pub install_label: String,
+    /// Manual-install URL (may be empty).
+    pub url: String,
+}
+
 /// Whether/how a project can be previewed (run locally).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewStatus {
     pub previewable: bool,
-    /// "web" (dev server), "static" (index.html), or a non-previewable kind.
+    /// "web" | "static" | "dotnet" | "maui" | "unsupported" | "unknown".
     pub kind: String,
-    /// "node" | "static" | "none".
+    /// "node" | "static" | "dotnet" | "none".
     pub runner: String,
     /// The npm script to run, if any (internal; harmless to the frontend).
     pub script: Option<String>,
     /// Node project missing its `node_modules`.
     pub needs_install: bool,
-    pub node_installed: bool,
+    /// Everything this preview needs, satisfied or not.
+    pub requirements: Vec<PreviewRequirement>,
+    /// All requirements satisfied (and deps installed) — ready to run.
+    pub ready: bool,
+    /// Friendly, plain-English explanation (esp. when not previewable).
     pub message: String,
+    /// What the preview will actually do, e.g. "Builds and launches the app".
+    pub how: String,
 }
 
 /// A started preview: the URL to load and the id used to stop it.
@@ -303,6 +343,18 @@ fn tool_catalog() -> &'static [ToolDef] {
             manual_only: false,
         },
         ToolDef {
+            key: "claude",
+            name: "Claude Code",
+            command: "claude",
+            probe_args: &["--version"],
+            brew: None,
+            winget: None,
+            url: "https://docs.anthropic.com/en/docs/claude-code/setup",
+            // Installed via `npm i -g @anthropic-ai/claude-code` or the native
+            // installer — not via brew/winget, so we don't auto-install it.
+            manual_only: true,
+        },
+        ToolDef {
             key: "android-studio",
             name: "Android Studio",
             command: "",
@@ -322,6 +374,16 @@ fn tool_catalog() -> &'static [ToolDef] {
             url: "https://apps.apple.com/app/xcode/id497799835",
             manual_only: true,
         },
+        ToolDef {
+            key: "flutter",
+            name: "Flutter SDK",
+            command: "flutter",
+            probe_args: &["--version"],
+            brew: None,
+            winget: None,
+            url: "https://docs.flutter.dev/get-started/install",
+            manual_only: true,
+        },
     ]
 }
 
@@ -332,9 +394,10 @@ fn find_tool(key: &str) -> Option<&'static ToolDef> {
 /// Which tools each template needs: `(tool_key, required)`.
 fn template_prereqs(template_id: &str) -> Vec<(&'static str, bool)> {
     match template_id {
-        "react-vite" | "vue-vite" | "svelte-vite" | "nextjs" | "node-express" => {
-            vec![("node", true)]
-        }
+        // Node-based (Vite family, Next, Astro, Angular, Electron, Express, NestJS).
+        "react-vite" | "vue-vite" | "svelte-vite" | "solid-vite" | "preact-vite"
+        | "vanilla-vite" | "nextjs" | "astro" | "angular" | "node-express" | "nestjs"
+        | "electron" => vec![("node", true)],
         "react-native" => {
             let mut v = vec![("node", true), ("android-studio", false)];
             // Xcode is only relevant (and detectable) on macOS.
@@ -343,10 +406,21 @@ fn template_prereqs(template_id: &str) -> Vec<(&'static str, bool)> {
             }
             v
         }
-        "aspnet-core" => vec![("dotnet", true)],
-        "python-fastapi" => vec![("python", true)],
+        // Tauri needs Node (frontend tooling) and Rust (the native shell).
+        "tauri" => vec![("node", true), ("cargo", true)],
+        "flutter" => vec![("flutter", true)],
+        "maui" | "wpf" | "aspnet-core" => vec![("dotnet", true)],
+        "python-fastapi" | "flask" => vec![("python", true)],
         "rust-cli" => vec![("cargo", true)],
         "go-module" => vec![("go", true)],
+        "android-native" => vec![("android-studio", true)],
+        "ios-native" | "macos-native" => {
+            if cfg!(target_os = "macos") {
+                vec![("xcode", true)]
+            } else {
+                vec![]
+            }
+        }
         "static-web" => vec![],
         _ => vec![],
     }
@@ -461,9 +535,13 @@ fn scaffold_for(template_id: &str, name: &str) -> Result<Scaffold, String> {
     };
 
     let scaffold = match template_id {
+        // --- Web (Vite family + others) ---
         "react-vite" => vite("react-ts"),
         "vue-vite" => vite("vue-ts"),
         "svelte-vite" => vite("svelte-ts"),
+        "solid-vite" => vite("solid-ts"),
+        "preact-vite" => vite("preact-ts"),
+        "vanilla-vite" => vite("vanilla-ts"),
 
         // npx --yes create-next-app@latest <name> <non-interactive flags>
         "nextjs" => Scaffold::Cli {
@@ -482,20 +560,102 @@ fn scaffold_for(template_id: &str, name: &str) -> Result<Scaffold, String> {
             ],
         },
 
-        // npx --yes create-expo-app@latest <name>
-        "react-native" => Scaffold::Cli {
-            program: "npx",
+        // npm create astro@latest <name> -- <non-interactive flags>
+        "astro" => Scaffold::Cli {
+            program: "npm",
             args: vec![
-                "--yes".into(),
-                "create-expo-app@latest".into(),
+                "create".into(),
+                "astro@latest".into(),
                 name.into(),
+                "--".into(),
+                "--template".into(),
+                "minimal".into(),
+                "--no-install".into(),
+                "--no-git".into(),
+                "--skip-houston".into(),
+                "--yes".into(),
             ],
         },
 
+        // npx --yes @angular/cli new <name> --defaults
+        "angular" => Scaffold::Cli {
+            program: "npx",
+            args: vec![
+                "--yes".into(),
+                "@angular/cli@latest".into(),
+                "new".into(),
+                name.into(),
+                "--defaults".into(),
+                "--skip-install".into(),
+                "--skip-git".into(),
+            ],
+        },
+
+        // --- Mobile ---
+        // npx --yes create-expo-app@latest <name>
+        "react-native" => Scaffold::Cli {
+            program: "npx",
+            args: vec!["--yes".into(), "create-expo-app@latest".into(), name.into()],
+        },
+        // flutter create <name>
+        "flutter" => Scaffold::Cli {
+            program: "flutter",
+            args: vec!["create".into(), name.into()],
+        },
+        // dotnet new maui -o <name> (cross-platform; needs the MAUI workload)
+        "maui" => Scaffold::Cli {
+            program: "dotnet",
+            args: vec!["new".into(), "maui".into(), "-o".into(), name.into()],
+        },
+        "android-native" => Scaffold::Files(native_placeholder_files(name, "android")),
+        "ios-native" => Scaffold::Files(native_placeholder_files(name, "ios")),
+        "macos-native" => Scaffold::Files(native_placeholder_files(name, "macos")),
+
+        // --- Desktop ---
+        // npm create tauri-app@latest <name> -- <flags>
+        "tauri" => Scaffold::Cli {
+            program: "npm",
+            args: vec![
+                "create".into(),
+                "tauri-app@latest".into(),
+                name.into(),
+                "--".into(),
+                "--template".into(),
+                "vanilla".into(),
+                "--manager".into(),
+                "npm".into(),
+                "--yes".into(),
+            ],
+        },
+        // npx --yes create-electron-app@latest <name>
+        "electron" => Scaffold::Cli {
+            program: "npx",
+            args: vec!["--yes".into(), "create-electron-app@latest".into(), name.into()],
+        },
+        // dotnet new wpf -o <name> (Windows)
+        "wpf" => Scaffold::Cli {
+            program: "dotnet",
+            args: vec!["new".into(), "wpf".into(), "-o".into(), name.into()],
+        },
+
+        // --- API ---
         // dotnet new webapi -o <name>
         "aspnet-core" => Scaffold::Cli {
             program: "dotnet",
             args: vec!["new".into(), "webapi".into(), "-o".into(), name.into()],
+        },
+        // npx --yes @nestjs/cli new <name> --package-manager npm --skip-git
+        "nestjs" => Scaffold::Cli {
+            program: "npx",
+            args: vec![
+                "--yes".into(),
+                "@nestjs/cli@latest".into(),
+                "new".into(),
+                name.into(),
+                "--package-manager".into(),
+                "npm".into(),
+                "--skip-git".into(),
+            ],
         },
 
         // cargo new <name>
@@ -507,12 +667,123 @@ fn scaffold_for(template_id: &str, name: &str) -> Result<Scaffold, String> {
         // File-based templates (work offline, no required CLI to scaffold).
         "node-express" => Scaffold::Files(node_express_files(name)),
         "python-fastapi" => Scaffold::Files(python_fastapi_files(name)),
+        "flask" => Scaffold::Files(flask_files(name)),
         "go-module" => Scaffold::Files(go_module_files(name)),
         "static-web" => Scaffold::Files(static_web_files(name)),
 
         other => return Err(format!("Unknown template: \"{other}\".")),
     };
     Ok(scaffold)
+}
+
+/// A guided starter for a true-native target (Android/iOS/macOS). We can't
+/// generate a full native project from a CLI (those need Android Studio / Xcode),
+/// so we lay down a folder + README that explains the next step.
+fn native_placeholder_files(name: &str, platform: &str) -> Vec<(&'static str, String)> {
+    let (ide, detail) = match platform {
+        "android" => (
+            "Android Studio",
+            "Open Android Studio → New Project, and create it inside this folder (Kotlin / Jetpack Compose).",
+        ),
+        "ios" => (
+            "Xcode",
+            "Open Xcode → Create New Project → iOS App (Swift / SwiftUI), and save it inside this folder.",
+        ),
+        _ => (
+            "Xcode",
+            "Open Xcode → Create New Project → macOS App (Swift / SwiftUI), and save it inside this folder.",
+        ),
+    };
+    vec![
+        (
+            "README.md",
+            format!(
+                "# {name}\n\nNative **{platform}** app starter.\n\nKinetek can't scaffold a full native {platform} project (that needs {ide}), so this folder is a placeholder.\n\n## Next step\n{detail}\n\nKinetek detects {ide} under the New Project prerequisites — install it from there if you don't have it yet.\n"
+            ),
+        ),
+        (".gitkeep", String::new()),
+    ]
+}
+
+/// Minimal Flask API starter (file-based, no CLI needed).
+fn flask_files(name: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "app.py",
+            "from flask import Flask, jsonify\n\napp = Flask(__name__)\n\n\n@app.get(\"/\")\ndef index():\n    return jsonify(message=\"Hello from Flask\")\n\n\nif __name__ == \"__main__\":\n    app.run(debug=True, port=5000)\n"
+                .to_string(),
+        ),
+        ("requirements.txt", "flask>=3.0\n".to_string()),
+        (
+            "README.md",
+            format!("# {name}\n\nFlask API.\n\n```bash\npython -m venv .venv && source .venv/bin/activate\npip install -r requirements.txt\npython app.py\n```\n"),
+        ),
+    ]
+}
+
+/// A representative starter for the chosen database engine. (Real provisioning
+/// and the in-app data viewer come later — this lays down schema + connection
+/// scaffolding so the shape is there.)
+fn database_files(engine: &str) -> Vec<(&'static str, String)> {
+    let e = engine.to_lowercase();
+    let mut files: Vec<(&'static str, String)> = Vec::new();
+
+    let (family, conn) = match e.as_str() {
+        "postgresql" | "postgres" => ("SQL", "postgresql://user:password@localhost:5432/appdb"),
+        "mysql" => ("SQL", "mysql://user:password@localhost:3306/appdb"),
+        "sqlite" => ("SQL", "sqlite:./app.db"),
+        "mongodb" | "mongo" => ("NoSQL", "mongodb://localhost:27017/appdb"),
+        _ => ("SQL", "your-connection-string"),
+    };
+
+    files.push((
+        "README.md",
+        format!(
+            "# Database — {engine}\n\nThis is a **{family}** database part, scaffolded by Kinetek.\n\n- `schema.*` — a starter schema you can grow.\n- `.env.example` — copy to `.env` and fill in real credentials.\n{}\n\n> An in-app **database viewer** (browse your data through Kinetek) is planned — this folder is the groundwork for it.\n",
+            if e != "sqlite" && family != "NoSQL-skip" {
+                "- `docker-compose.yml` — spin the database up locally with `docker compose up -d`."
+            } else if e == "sqlite" {
+                "- SQLite is file-based — no server needed."
+            } else {
+                ""
+            }
+        ),
+    ));
+
+    files.push((".env.example", format!("DATABASE_URL={conn}\n")));
+
+    if family == "SQL" {
+        files.push((
+            "schema.sql",
+            "-- Starter schema. Grow this as your app needs.\nCREATE TABLE users (\n    id          INTEGER PRIMARY KEY,\n    email       TEXT NOT NULL UNIQUE,\n    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n);\n"
+                .to_string(),
+        ));
+    } else {
+        files.push((
+            "schema.md",
+            "# Collections\n\n## users\n```json\n{\n  \"_id\": \"ObjectId\",\n  \"email\": \"string (unique)\",\n  \"createdAt\": \"date\"\n}\n```\n"
+                .to_string(),
+        ));
+    }
+
+    // A docker-compose for server engines so the DB can actually be run later.
+    let compose = match e.as_str() {
+        "postgresql" | "postgres" => Some(
+            "services:\n  db:\n    image: postgres:16\n    environment:\n      POSTGRES_USER: user\n      POSTGRES_PASSWORD: password\n      POSTGRES_DB: appdb\n    ports:\n      - \"5432:5432\"\n    volumes:\n      - dbdata:/var/lib/postgresql/data\nvolumes:\n  dbdata:\n",
+        ),
+        "mysql" => Some(
+            "services:\n  db:\n    image: mysql:8\n    environment:\n      MYSQL_ROOT_PASSWORD: password\n      MYSQL_DATABASE: appdb\n      MYSQL_USER: user\n      MYSQL_PASSWORD: password\n    ports:\n      - \"3306:3306\"\n    volumes:\n      - dbdata:/var/lib/mysql\nvolumes:\n  dbdata:\n",
+        ),
+        "mongodb" | "mongo" => Some(
+            "services:\n  db:\n    image: mongo:7\n    ports:\n      - \"27017:27017\"\n    volumes:\n      - dbdata:/data/db\nvolumes:\n  dbdata:\n",
+        ),
+        _ => None,
+    };
+    if let Some(c) = compose {
+        files.push(("docker-compose.yml", c.to_string()));
+    }
+
+    files
 }
 
 fn node_express_files(name: &str) -> Vec<(&'static str, String)> {
@@ -719,11 +990,102 @@ fn detect_frameworks(path: &Path) -> Vec<String> {
 // Core (sync) implementations — run on a blocking thread.
 // ---------------------------------------------------------------------------
 
+/// Run one scaffold into `run_dir`, creating a subfolder named `folder`
+/// (CLI tools create it themselves; file-based ones write into `run_dir/folder`).
+/// Output streams live via `project-output`.
+fn apply_scaffold(
+    app: &tauri::AppHandle,
+    scaffold: Scaffold,
+    run_dir: &Path,
+    folder: &str,
+) -> Result<(), String> {
+    match scaffold {
+        Scaffold::Cli { program, args } => {
+            let _ = app.emit(
+                "project-output",
+                OutputLine {
+                    line: format!("$ {} {}", program, args.join(" ")),
+                    stream: "stdout".into(),
+                },
+            );
+            // CI=1 + a null stdin keep scaffolders non-interactive.
+            let mut child = make_command(program, &args)
+                .current_dir(run_dir)
+                .env("CI", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    format!("Could not run `{program}`: {e}\n\nMake sure {program} is installed and available on your PATH.")
+                })?;
+
+            let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+            let mut handles = Vec::new();
+            if let Some(out) = child.stdout.take() {
+                handles.push(stream_and_collect(app.clone(), out, "stdout", collected.clone()));
+            }
+            if let Some(err) = child.stderr.take() {
+                handles.push(stream_and_collect(app.clone(), err, "stderr", collected.clone()));
+            }
+            let exit = child
+                .wait()
+                .map_err(|e| format!("`{program}` failed while running: {e}"))?;
+            for h in handles {
+                let _ = h.join();
+            }
+            if !exit.success() {
+                let detail = collected.lock().map(|v| v.join("\n")).unwrap_or_default();
+                let detail = detail.trim();
+                return Err(format!(
+                    "`{program}` exited with an error:\n\n{}",
+                    if detail.is_empty() { "(no output)" } else { detail }
+                ));
+            }
+            Ok(())
+        }
+        Scaffold::Files(files) => {
+            let base = run_dir.join(folder);
+            write_files(app, &base, files)
+        }
+    }
+}
+
+/// Write a (relative path, contents) file set into `base`, streaming progress.
+fn write_files(
+    app: &tauri::AppHandle,
+    base: &Path,
+    files: Vec<(&'static str, String)>,
+) -> Result<(), String> {
+    fs::create_dir_all(base)
+        .map_err(|e| format!("Could not create {}: {e}", base.display()))?;
+    for (rel, contents) in files {
+        let target = base.join(rel);
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        }
+        fs::write(&target, contents)
+            .map_err(|e| format!("Could not write {}: {e}", target.display()))?;
+        let _ = app.emit(
+            "project-output",
+            OutputLine {
+                line: format!("Created {}/{rel}", base.file_name().and_then(|n| n.to_str()).unwrap_or("")),
+                stream: "stdout".into(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn create_project_inner(
     app: tauri::AppHandle,
     parent_dir: String,
     project_name: String,
-    template_id: String,
+    app_template_id: String,
+    api_template_id: Option<String>,
+    database_engine: Option<String>,
     summary: String,
     status: String,
     frameworks: Vec<String>,
@@ -744,6 +1106,10 @@ fn create_project_inner(
         ));
     }
 
+    let api_id = api_template_id.filter(|s| !s.trim().is_empty());
+    let db_engine = database_engine.filter(|s| !s.trim().is_empty());
+    let monorepo = api_id.is_some() || db_engine.is_some();
+
     let project_path = parent.join(name);
     if project_path.exists() {
         return Err(format!(
@@ -751,80 +1117,51 @@ fn create_project_inner(
         ));
     }
 
-    match scaffold_for(&template_id, name)? {
-        Scaffold::Cli { program, args } => {
-            // Echo the command, then stream its output live to the UI.
+    let stack = ProjectStack {
+        app: app_template_id.clone(),
+        api: api_id.clone(),
+        database: db_engine.clone(),
+    };
+
+    if !monorepo {
+        // Simple project: scaffold the app directly at parent/<name>.
+        apply_scaffold(&app, scaffold_for(&app_template_id, name)?, &parent, name)?;
+    } else {
+        // Monorepo: <name>/app, <name>/api, <name>/database under one folder.
+        fs::create_dir_all(&project_path)
+            .map_err(|e| format!("Could not create the project folder: {e}"))?;
+
+        let _ = app.emit(
+            "project-output",
+            OutputLine { line: "— Creating app —".into(), stream: "stdout".into() },
+        );
+        apply_scaffold(&app, scaffold_for(&app_template_id, "app")?, &project_path, "app")?;
+
+        if let Some(api) = &api_id {
             let _ = app.emit(
                 "project-output",
-                OutputLine {
-                    line: format!("$ {} {}", program, args.join(" ")),
-                    stream: "stdout".into(),
-                },
+                OutputLine { line: "— Creating API —".into(), stream: "stdout".into() },
             );
-
-            // CI=1 + a null stdin keep scaffolders non-interactive: any prompt
-            // reads EOF and the tool exits with an error instead of hanging.
-            let mut child = make_command(program, &args)
-                .current_dir(&parent)
-                .env("CI", "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| {
-                    format!(
-                        "Could not run `{program}`: {e}\n\nMake sure {program} is installed and available on your PATH."
-                    )
-                })?;
-
-            let collected = Arc::new(Mutex::new(Vec::<String>::new()));
-            let mut handles = Vec::new();
-            if let Some(out) = child.stdout.take() {
-                handles.push(stream_and_collect(app.clone(), out, "stdout", collected.clone()));
-            }
-            if let Some(err) = child.stderr.take() {
-                handles.push(stream_and_collect(app.clone(), err, "stderr", collected.clone()));
-            }
-
-            let exit = child
-                .wait()
-                .map_err(|e| format!("`{program}` failed while running: {e}"))?;
-            for h in handles {
-                let _ = h.join();
-            }
-
-            if !exit.success() {
-                let detail = collected
-                    .lock()
-                    .map(|v| v.join("\n"))
-                    .unwrap_or_default();
-                let detail = detail.trim();
-                return Err(format!(
-                    "`{program}` exited with an error:\n\n{}",
-                    if detail.is_empty() { "(no output)" } else { detail }
-                ));
-            }
+            apply_scaffold(&app, scaffold_for(api, "api")?, &project_path, "api")?;
         }
-        Scaffold::Files(files) => {
-            fs::create_dir_all(&project_path)
-                .map_err(|e| format!("Could not create the project folder: {e}"))?;
-            for (rel, contents) in files {
-                let target = project_path.join(rel);
-                if let Some(dir) = target.parent() {
-                    fs::create_dir_all(dir)
-                        .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-                }
-                fs::write(&target, contents)
-                    .map_err(|e| format!("Could not write {}: {e}", target.display()))?;
-                let _ = app.emit(
-                    "project-output",
-                    OutputLine {
-                        line: format!("Created {rel}"),
-                        stream: "stdout".into(),
-                    },
-                );
-            }
+
+        if let Some(engine) = &db_engine {
+            let _ = app.emit(
+                "project-output",
+                OutputLine { line: "— Creating database —".into(), stream: "stdout".into() },
+            );
+            write_files(&app, &project_path.join("database"), database_files(engine))?;
         }
+
+        // A root README describing the assembled parts.
+        let mut readme = format!("# {name}\n\nCreated with Kinetek.\n\n## Structure\n- `app/` — application\n");
+        if api_id.is_some() {
+            readme.push_str("- `api/` — API service\n");
+        }
+        if let Some(engine) = &db_engine {
+            readme.push_str(&format!("- `database/` — {engine} (schema + setup)\n"));
+        }
+        let _ = fs::write(project_path.join("README.md"), readme);
     }
 
     Ok(ProjectInfo {
@@ -835,6 +1172,7 @@ fn create_project_inner(
         status,
         frameworks,
         has_preview: true,
+        stack: Some(stack),
     })
 }
 
@@ -874,6 +1212,7 @@ fn scan_projects_inner(dir: String) -> Result<Vec<ProjectInfo>, String> {
             status: "In Development".into(),
             frameworks,
             has_preview: path.join("package.json").exists(),
+            stack: None,
         });
     }
 
@@ -975,9 +1314,67 @@ fn resolve_brew() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Decide whether/how a project can be previewed.
-fn preview_plan(path: &Path) -> PreviewStatus {
-    let node_installed = tool_present("node", &["--version"]).is_some();
+/// Build a preview requirement from the shared tool catalog (node/dotnet/…).
+fn tool_requirement(key: &str) -> PreviewRequirement {
+    let pre = check_one(key, true);
+    let detail = if pre.installed {
+        pre.version.clone().unwrap_or_else(|| "Installed".into())
+    } else {
+        pre.install_hint.clone()
+    };
+    PreviewRequirement {
+        key: pre.key,
+        name: pre.name.clone(),
+        satisfied: pre.installed,
+        detail,
+        installable: pre.auto_installable && !pre.installed,
+        install_label: format!("Install {}", pre.name),
+        url: pre.url,
+    }
+}
 
+/// Is a given .NET SDK workload (e.g. "maui") installed?
+fn dotnet_workload_present(name: &str) -> bool {
+    Command::new("dotnet")
+        .args(["workload", "list"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains(&name.to_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+/// Find a .NET project/solution in `path` and whether it looks like a MAUI app.
+fn find_dotnet(path: &Path) -> Option<(PathBuf, bool)> {
+    let mut csproj: Option<PathBuf> = None;
+    let mut sln: Option<PathBuf> = None;
+    for entry in fs::read_dir(path).ok()?.flatten() {
+        let p = entry.path();
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("csproj") if csproj.is_none() => csproj = Some(p),
+            Some("sln") if sln.is_none() => sln = Some(p),
+            _ => {}
+        }
+    }
+    let chosen = csproj.clone().or(sln)?;
+    // Heuristic MAUI detection from the .csproj contents.
+    let is_maui = csproj
+        .map(|c| {
+            let body = fs::read_to_string(&c).unwrap_or_default().to_lowercase();
+            body.contains("usemaui")
+                || body.contains("microsoft.maui")
+                || body.contains("-android")
+                || body.contains("-ios")
+                || body.contains("-maccatalyst")
+        })
+        .unwrap_or(false);
+    Some((chosen, is_maui))
+}
+
+fn preview_plan(path: &Path) -> PreviewStatus {
     let pkg = path.join("package.json");
     if pkg.exists() {
         let content = fs::read_to_string(&pkg).unwrap_or_default();
@@ -995,23 +1392,32 @@ fn preview_plan(path: &Path) -> PreviewStatus {
             });
 
         return match script {
-            Some(s) => PreviewStatus {
-                previewable: true,
-                kind: "web".into(),
-                runner: "node".into(),
-                script: Some(s),
-                needs_install: !path.join("node_modules").exists(),
-                node_installed,
-                message: String::new(),
-            },
+            Some(s) => {
+                let node = tool_requirement("node");
+                let needs_install = !path.join("node_modules").exists();
+                let ready = node.satisfied && !needs_install;
+                PreviewStatus {
+                    previewable: true,
+                    kind: "web".into(),
+                    runner: "node".into(),
+                    script: Some(s),
+                    needs_install,
+                    requirements: vec![node],
+                    ready,
+                    message: String::new(),
+                    how: "Runs the dev server and opens it in a Kinetek window.".into(),
+                }
+            }
             None => PreviewStatus {
                 previewable: false,
-                kind: "node".into(),
-                runner: "node".into(),
+                kind: "unsupported".into(),
+                runner: "none".into(),
                 script: None,
                 needs_install: false,
-                node_installed,
-                message: "This project has no \"dev\", \"start\" or \"serve\" script to preview.".into(),
+                requirements: vec![],
+                ready: false,
+                message: "This Node project has no \"dev\", \"start\" or \"serve\" script to preview. Add one to its package.json, then try again.".into(),
+                how: String::new(),
             },
         };
     }
@@ -1023,19 +1429,65 @@ fn preview_plan(path: &Path) -> PreviewStatus {
             runner: "static".into(),
             script: None,
             needs_install: false,
-            node_installed,
+            requirements: vec![],
+            ready: true,
             message: String::new(),
+            how: "Opens the page in a Kinetek window.".into(),
+        };
+    }
+
+    // .NET (incl. MAUI): build & launch the app.
+    if let Some((_, is_maui)) = find_dotnet(path) {
+        let dotnet = tool_requirement("dotnet");
+        let dotnet_ok = dotnet.satisfied;
+        let mut requirements = vec![dotnet];
+        if is_maui {
+            let present = dotnet_ok && dotnet_workload_present("maui");
+            requirements.push(PreviewRequirement {
+                key: "maui".into(),
+                name: ".NET MAUI workload".into(),
+                satisfied: present,
+                detail: if present {
+                    "Installed".into()
+                } else if dotnet_ok {
+                    "Needed to build MAUI apps — Kinetek can install it.".into()
+                } else {
+                    "Requires the .NET SDK first.".into()
+                },
+                // Only installable once the SDK exists (we install via `dotnet`).
+                installable: dotnet_ok && !present,
+                install_label: "Install MAUI workload".into(),
+                url: "https://learn.microsoft.com/dotnet/maui/get-started/installation".into(),
+            });
+        }
+        let ready = requirements.iter().all(|r| r.satisfied);
+        return PreviewStatus {
+            previewable: true,
+            kind: if is_maui { "maui".into() } else { "dotnet".into() },
+            runner: "dotnet".into(),
+            script: None,
+            needs_install: false,
+            requirements,
+            ready,
+            message: String::new(),
+            how: if is_maui {
+                "Builds the MAUI app and launches it (opens in its own window).".into()
+            } else {
+                "Builds the project and runs it.".into()
+            },
         };
     }
 
     PreviewStatus {
         previewable: false,
-        kind: "unknown".into(),
+        kind: "unsupported".into(),
         runner: "none".into(),
         script: None,
         needs_install: false,
-        node_installed,
-        message: "Preview supports web projects — a Node dev server or a static site. This project type isn't previewable yet.".into(),
+        requirements: vec![],
+        ready: false,
+        message: "Preview can run web projects (a Node dev server or static site) and .NET apps. This project type isn't supported yet — open it in your editor to run it.".into(),
+        how: String::new(),
     }
 }
 
@@ -1085,8 +1537,90 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Separates the friendly preview error from the raw developer detail so the
+/// frontend can show one in plain English and the other behind a "details"
+/// toggle. (Chosen to never collide with normal compiler output.)
+const PREVIEW_DEV_SEP: &str = "||KINETEK_DEV||";
+
+/// Pack a friendly message + raw output into a single error string.
+fn preview_error(friendly: &str, raw: &str) -> String {
+    let raw = raw.trim();
+    // Cap the dev detail so a giant build log doesn't bloat the payload.
+    let tail: String = if raw.chars().count() > 6000 {
+        let skip = raw.chars().count() - 6000;
+        raw.chars().skip(skip).collect()
+    } else {
+        raw.to_string()
+    };
+    if tail.is_empty() {
+        friendly.to_string()
+    } else {
+        format!("{friendly}{PREVIEW_DEV_SEP}{tail}")
+    }
+}
+
+/// Turn raw `dotnet` build output into a plain-English reason.
+fn classify_dotnet_failure(raw: &str, is_maui: bool) -> String {
+    let l = raw.to_lowercase();
+    if l.contains("workload") && (l.contains("not installed") || l.contains("maui") || l.contains("missing")) {
+        return "This project needs the .NET MAUI workload. Install it above, then run the preview again.".into();
+    }
+    if is_maui && (l.contains("--framework") || l.contains("specify a") || l.contains("targetframework")) {
+        return "This MAUI app needs a specific target platform to run, or targets an older setup — it likely needs attention before it can be displayed.".into();
+    }
+    if l.contains("netsdk") || l.contains("does not support targeting") || l.contains("downgrade") || (l.contains("sdk") && l.contains("not found")) {
+        return "This app targets a .NET version your machine doesn't have — it looks like an older project that needs updating before it can run.".into();
+    }
+    if l.contains("error") || l.contains("msb") {
+        return "The project didn't build — it may be old and need attention before it can be previewed. See developer details for the exact errors.".into();
+    }
+    "The preview couldn't complete. Open developer details to see the exact error.".into()
+}
+
+/// Build a .NET project and, on success, launch it (it opens in its own window).
+/// On failure returns a friendly+raw error so the UI can show both.
+fn start_dotnet_preview(
+    path: &Path,
+    is_maui: bool,
+    id: String,
+) -> Result<(String, String, Option<Child>), String> {
+    if tool_present("dotnet", &["--version"]).is_none() {
+        return Err("The .NET SDK is required to preview this project.".into());
+    }
+
+    // Build first (bounded) so broken/old projects fail with a real reason.
+    let build = make_command("dotnet", &["build".to_string(), "-nologo".to_string()])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Could not run dotnet: {e}. Is the .NET SDK on your PATH?"))?;
+    if !build.status.success() {
+        let raw = format!(
+            "{}{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        return Err(preview_error(&classify_dotnet_failure(&raw, is_maui), &raw));
+    }
+
+    // Built cleanly → launch it detached. The app surfaces in its own window;
+    // a clean build is our "it works" signal.
+    let mut run = make_command("dotnet", &["run".to_string(), "--no-build".to_string()]);
+    run.current_dir(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        run.process_group(0);
+    }
+    let child = run.spawn().ok();
+    Ok((id, String::new(), child))
+}
+
 /// Start the dev server (or resolve a static URL). Returns the preview id, the
-/// URL to load, and the child process to track (None for static sites).
+/// URL to load (empty for native apps), and the child process to track.
 fn start_preview_inner(
     project_path: String,
 ) -> Result<(String, String, Option<Child>), String> {
@@ -1108,14 +1642,19 @@ fn start_preview_inner(
             .unwrap_or(0)
     );
 
-    if plan.kind == "static" {
+    if plan.runner == "static" {
         let index = path.join("index.html");
         let url = format!("file://{}", index.to_string_lossy());
         return Ok((id, url, None));
     }
 
+    // .NET (incl. MAUI): build, then launch the app in its own window.
+    if plan.runner == "dotnet" {
+        return start_dotnet_preview(&path, plan.kind == "maui", id);
+    }
+
     // Node dev server.
-    if !plan.node_installed {
+    if tool_present("node", &["--version"]).is_none() {
         return Err("Node.js is required to preview this project.".into());
     }
     let script = plan
@@ -1160,13 +1699,17 @@ fn start_preview_inner(
 // Tauri commands (the frontend-facing API)
 // ---------------------------------------------------------------------------
 
-/// Bootstrap a new project from a template by running its framework CLI.
+/// Bootstrap a new project: an app, plus an optional API and database, assembled
+/// into one project folder.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn create_project(
     app: tauri::AppHandle,
     parent_dir: String,
     project_name: String,
-    template_id: String,
+    app_template_id: String,
+    api_template_id: Option<String>,
+    database_engine: Option<String>,
     summary: String,
     status: String,
     frameworks: Vec<String>,
@@ -1176,7 +1719,9 @@ async fn create_project(
             app,
             parent_dir,
             project_name,
-            template_id,
+            app_template_id,
+            api_template_id,
+            database_engine,
             summary,
             status,
             frameworks,
@@ -1284,8 +1829,10 @@ async fn preview_status(project_path: String) -> Result<PreviewStatus, String> {
                 runner: "none".into(),
                 script: None,
                 needs_install: false,
-                node_installed: false,
+                requirements: vec![],
+                ready: false,
                 message: "That folder no longer exists.".into(),
+                how: String::new(),
             };
         }
         preview_plan(&path)
@@ -1315,6 +1862,61 @@ async fn install_deps(project_path: String) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("The install task failed unexpectedly: {e}"))?
+}
+
+/// Install a single preview requirement (preview-only convenience). Handles the
+/// shared tools (node/dotnet via the package manager) and the .NET MAUI workload
+/// (`dotnet workload install maui`). Errors carry friendly + raw detail.
+#[tauri::command]
+async fn install_preview_requirement(key: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || install_preview_requirement_inner(key))
+        .await
+        .map_err(|e| format!("The install task failed unexpectedly: {e}"))?
+}
+
+fn install_preview_requirement_inner(key: String) -> Result<(), String> {
+    match key.as_str() {
+        "node" | "dotnet" => install_tool_inner(key.clone())
+            .map_err(|raw| preview_error(&format!("Couldn't install {key} automatically."), &raw)),
+        "maui" => {
+            if tool_present("dotnet", &["--version"]).is_none() {
+                return Err(preview_error(
+                    "Install the .NET SDK first, then the MAUI workload.",
+                    "dotnet was not found on your PATH.",
+                ));
+            }
+            let out = make_command(
+                "dotnet",
+                &["workload".to_string(), "install".to_string(), "maui".to_string()],
+            )
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| {
+                preview_error("Could not run dotnet to install the MAUI workload.", &e.to_string())
+            })?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let raw = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let l = raw.to_lowercase();
+            let friendly = if l.contains("permission")
+                || l.contains("denied")
+                || l.contains("administrator")
+                || l.contains("elevated")
+                || l.contains("sudo")
+            {
+                "Installing the MAUI workload needs elevated permissions. Run `dotnet workload install maui` in a terminal (with sudo / as admin), then come back."
+            } else {
+                "Couldn't install the .NET MAUI workload automatically."
+            };
+            Err(preview_error(friendly, &raw))
+        }
+        other => Err(format!("Don't know how to install \"{other}\" for preview.")),
+    }
 }
 
 /// Start a preview (dev server or static site) and return its URL + id.
@@ -1891,10 +2493,607 @@ async fn git_clone(url: String, dest: String, token: String) -> Result<ProjectIn
             status: "In Development".into(),
             frameworks: detect_frameworks(&target),
             has_preview: target.join("package.json").exists(),
+            stack: None,
         })
     })
     .await
     .map_err(|e| format!("The clone task failed unexpectedly: {e}"))?
+}
+
+/// Local changes for a file (or the whole working tree) as a unified diff vs the
+/// last commit. Untracked single files are synthesized as an all-added diff so
+/// the user can still see their contents.
+#[tauri::command]
+async fn git_diff(path: String, file: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+
+        // Untracked single file → show its contents as added lines.
+        if let Some(f) = &file {
+            let porcelain = run_git(&p, &["status", "--porcelain", "--", f]).unwrap_or_default();
+            if porcelain.lines().any(|l| l.starts_with("??")) {
+                let content = fs::read_to_string(p.join(f)).unwrap_or_default();
+                let mut out = format!("diff --git a/{f} b/{f}\nnew file\n--- /dev/null\n+++ b/{f}\n");
+                for line in content.lines() {
+                    out.push('+');
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                return Ok(out);
+            }
+        }
+
+        // Tracked changes vs HEAD (staged + unstaged). Falls back to the index
+        // diff if there are no commits yet.
+        let with_head: Vec<String> = {
+            let mut a = vec!["diff".to_string(), "HEAD".to_string()];
+            if let Some(f) = &file {
+                a.push("--".into());
+                a.push(f.clone());
+            }
+            a
+        };
+        let refs: Vec<&str> = with_head.iter().map(|s| s.as_str()).collect();
+        match run_git(&p, &refs) {
+            Ok(out) => Ok(out),
+            Err(e) if e.contains("ambiguous argument") || e.contains("unknown revision") => {
+                let mut a = vec!["diff"];
+                if let Some(f) = &file {
+                    a.push("--");
+                    a.push(f.as_str());
+                }
+                run_git(&p, &a)
+            }
+            Err(e) => Err(format!("Could not read the diff: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("The diff task failed unexpectedly: {e}"))?
+}
+
+/// Remove the `origin` remote (used after deleting the GitHub repo). The local
+/// files and history stay; the project just becomes "not connected".
+#[tauri::command]
+async fn git_remove_remote(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let _ = run_git(&p, &["remote", "remove", "origin"]);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("The remote task failed unexpectedly: {e}"))?
+}
+
+// --- Git refs (branches / remotes / tags) + stashes ------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRefs {
+    /// Current branch (or "HEAD" when detached).
+    pub current: String,
+    pub detached: bool,
+    pub branches: Vec<String>,
+    /// Remote-tracking branches, e.g. "origin/main".
+    pub remotes: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashEntry {
+    /// Position in the stash list (stash@{index}).
+    pub index: usize,
+    pub message: String,
+}
+
+/// Split command output into trimmed, non-empty lines.
+fn split_lines(out: String) -> Vec<String> {
+    out.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// List branches, remote-tracking branches, and tags for the refs sidebar.
+#[tauri::command]
+async fn git_refs(path: String) -> Result<GitRefs, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let current = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let detached = current.is_empty() || current == "HEAD";
+        let branches = run_git(&p, &["branch", "--format=%(refname:short)"])
+            .map(split_lines)
+            .unwrap_or_default();
+        let remotes = run_git(&p, &["branch", "-r", "--format=%(refname:short)"])
+            .map(split_lines)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| !r.ends_with("/HEAD"))
+            .collect();
+        let tags = run_git(&p, &["tag", "--sort=-creatordate"])
+            .map(split_lines)
+            .unwrap_or_default();
+        Ok(GitRefs {
+            current,
+            detached,
+            branches,
+            remotes,
+            tags,
+        })
+    })
+    .await
+    .map_err(|e| format!("The refs task failed unexpectedly: {e}"))?
+}
+
+/// Create a branch (optionally at a specific commit, optionally checking it out).
+#[tauri::command]
+async fn git_create_branch(
+    path: String,
+    name: String,
+    at: Option<String>,
+    checkout: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("Enter a branch name.".to_string());
+        }
+        let mut args: Vec<&str> = if checkout {
+            vec!["checkout", "-b", &name]
+        } else {
+            vec!["branch", &name]
+        };
+        if let Some(a) = at.as_deref() {
+            if !a.trim().is_empty() {
+                args.push(a.trim());
+            }
+        }
+        run_git(&p, &args).map(|_| ()).map_err(|e| {
+            if e.contains("already exists") {
+                format!("A branch named \"{name}\" already exists.")
+            } else {
+                format!("Could not create the branch: {e}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("The branch task failed unexpectedly: {e}"))?
+}
+
+/// Switch to a branch/ref. Friendly error when uncommitted changes conflict.
+#[tauri::command]
+async fn git_checkout(path: String, reference: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let r = reference.trim();
+        if r.is_empty() {
+            return Err("No branch given.".to_string());
+        }
+        run_git(&p, &["checkout", r]).map(|_| ()).map_err(|e| {
+            if e.contains("would be overwritten") || e.contains("local changes") {
+                "You have uncommitted changes that would conflict. Commit or stash them first.".to_string()
+            } else {
+                format!("Could not switch branch: {e}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("The checkout task failed unexpectedly: {e}"))?
+}
+
+/// Delete a local branch (force to discard an unmerged one).
+#[tauri::command]
+async fn git_delete_branch(path: String, name: String, force: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let name = name.trim();
+        let flag = if force { "-D" } else { "-d" };
+        run_git(&p, &["branch", flag, name]).map(|_| ()).map_err(|e| {
+            if e.contains("not fully merged") {
+                format!("\"{name}\" has unmerged commits. Use force-delete to discard them.")
+            } else {
+                format!("Could not delete the branch: {e}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("The branch task failed unexpectedly: {e}"))?
+}
+
+/// List saved stashes (most recent first).
+#[tauri::command]
+async fn git_stashes(path: String) -> Result<Vec<StashEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let out = run_git(&p, &["stash", "list", "--format=%gs"]).unwrap_or_default();
+        Ok(out
+            .lines()
+            .enumerate()
+            .map(|(index, line)| StashEntry {
+                index,
+                // Strip the noisy "WIP on <branch>: <sha> " prefix when present.
+                message: line
+                    .split_once(": ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(line)
+                    .trim()
+                    .to_string(),
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("The stash task failed unexpectedly: {e}"))?
+}
+
+/// Stash the working tree (including untracked files) so it isn't pushed yet.
+#[tauri::command]
+async fn git_stash_save(path: String, message: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let mut args: Vec<&str> = vec!["stash", "push", "--include-untracked"];
+        let msg = message.unwrap_or_default();
+        let msg = msg.trim();
+        if !msg.is_empty() {
+            args.push("-m");
+            args.push(msg);
+        }
+        run_git(&p, &args).map(|_| ()).map_err(|e| {
+            if e.contains("No local changes") {
+                "There are no changes to stash.".to_string()
+            } else {
+                format!("Could not stash: {e}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("The stash task failed unexpectedly: {e}"))?
+}
+
+/// Apply a stash by index. `pop` removes it from the list afterwards.
+#[tauri::command]
+async fn git_stash_apply(path: String, index: usize, pop: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let stash = format!("stash@{{{index}}}");
+        let verb = if pop { "pop" } else { "apply" };
+        run_git(&p, &["stash", verb, &stash])
+            .map(|_| ())
+            .map_err(|e| {
+                if e.contains("conflict") {
+                    "Applying the stash hit a conflict — resolve it in your editor.".to_string()
+                } else {
+                    format!("Could not apply the stash: {e}")
+                }
+            })
+    })
+    .await
+    .map_err(|e| format!("The stash task failed unexpectedly: {e}"))?
+}
+
+/// Delete a stash by index.
+#[tauri::command]
+async fn git_stash_drop(path: String, index: usize) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let stash = format!("stash@{{{index}}}");
+        run_git(&p, &["stash", "drop", &stash])
+            .map(|_| ())
+            .map_err(|e| format!("Could not drop the stash: {e}"))
+    })
+    .await
+    .map_err(|e| format!("The stash task failed unexpectedly: {e}"))?
+}
+
+// --- Claude Code delegation ------------------------------------------------
+
+/// Tracks running `claude` agent processes (run id → pid) so they can be stopped.
+/// `Arc` so the map can be moved into the blocking worker that owns the run.
+#[derive(Default)]
+struct ClaudeState(Arc<Mutex<HashMap<String, u32>>>);
+
+/// Check a single tool from the catalog (e.g. "claude") — used by the UI to
+/// detect whether Claude Code is installed before offering it.
+#[tauri::command]
+async fn check_tool(key: String) -> Result<Prerequisite, String> {
+    tauri::async_runtime::spawn_blocking(move || check_one(&key, true))
+        .await
+        .map_err(|e| format!("The tool check failed unexpectedly: {e}"))
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeLine {
+    run_id: String,
+    line: String,
+    stream: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeDone {
+    run_id: String,
+    ok: bool,
+}
+
+/// Delegate a prompt to the installed Claude Code CLI, running in the project's
+/// directory so it has full context of that project. Output streams to the UI
+/// via `claude-output` events; a final `claude-done` event reports the outcome.
+/// `mode` maps to Claude Code's `--permission-mode` ("plan" = safe/read-only,
+/// "acceptEdits" = allowed to change files). The user's own Claude Code auth is
+/// used — Kinetek handles no secret for this.
+#[tauri::command]
+async fn run_claude_agent(
+    app: tauri::AppHandle,
+    state: State<'_, ClaudeState>,
+    run_id: String,
+    project_path: String,
+    prompt: String,
+    mode: String,
+) -> Result<(), String> {
+    let path = PathBuf::from(&project_path);
+    if !path.is_dir() {
+        return Err(format!("The path \"{}\" no longer exists.", path.display()));
+    }
+    if tool_present("claude", &["--version"]).is_none() {
+        return Err("Claude Code isn't installed. Install the `claude` CLI, then try again.".into());
+    }
+    let mode = match mode.as_str() {
+        "acceptEdits" | "plan" | "default" | "bypassPermissions" => mode,
+        _ => "plan".to_string(),
+    };
+    // Clone the Arc so the blocking worker (which owns the run) can update it.
+    let pids = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_claude_inner(app, pids, run_id, path, prompt, mode)
+    })
+    .await
+    .map_err(|e| format!("The Claude task failed unexpectedly: {e}"))?
+}
+
+fn run_claude_inner(
+    app: tauri::AppHandle,
+    pids: Arc<Mutex<HashMap<String, u32>>>,
+    run_id: String,
+    path: PathBuf,
+    prompt: String,
+    mode: String,
+) -> Result<(), String> {
+    // Stream JSON events (NDJSON) so the UI shows activity as it happens — the
+    // default text mode buffers until the whole turn finishes (feels "stuck").
+    // `--verbose` is required for stream-json in print mode.
+    let mut cmd = make_command(
+        "claude",
+        &[
+            "-p".to_string(),
+            prompt,
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--permission-mode".to_string(),
+            mode,
+        ],
+    );
+    cmd.current_dir(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Could not start Claude Code: {e}. Is `claude` on your PATH?"))?;
+
+    // Track the pid so `stop_claude` can signal the whole process group.
+    if let Ok(mut map) = pids.lock() {
+        map.insert(run_id.clone(), child.id());
+    }
+
+    let mut handles = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let app1 = app.clone();
+        let id1 = run_id.clone();
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = app1.emit(
+                    "claude-output",
+                    ClaudeLine { run_id: id1.clone(), line, stream: "stdout".into() },
+                );
+            }
+        }));
+    }
+    if let Some(err) = child.stderr.take() {
+        let app2 = app.clone();
+        let id2 = run_id.clone();
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = app2.emit(
+                    "claude-output",
+                    ClaudeLine { run_id: id2.clone(), line, stream: "stderr".into() },
+                );
+            }
+        }));
+    }
+
+    let status = child.wait();
+    for h in handles {
+        let _ = h.join();
+    }
+    if let Ok(mut map) = pids.lock() {
+        map.remove(&run_id);
+    }
+
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    let _ = app.emit("claude-done", ClaudeDone { run_id, ok });
+    Ok(())
+}
+
+/// Stop a running Claude Code agent (signals its process group on Unix).
+#[tauri::command]
+fn stop_claude(state: State<'_, ClaudeState>, run_id: String) -> Result<(), String> {
+    if let Some(pid) = state.0.lock().ok().and_then(|m| m.get(&run_id).copied()) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+        }
+    }
+    Ok(())
+}
+
+// --- Interactive terminal (PTY) --------------------------------------------
+
+/// One live PTY session: the master (for resize), a writer for input, and the
+/// child shell (so it can be killed on close).
+struct TermSession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+#[derive(Default)]
+struct TerminalState(Mutex<HashMap<String, TermSession>>);
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TermData {
+    id: String,
+    /// Raw PTY output bytes (xterm decodes UTF-8 itself).
+    bytes: Vec<u8>,
+}
+
+/// Open a real interactive shell in a PTY, rooted at `cwd`. Output streams to
+/// the UI as `terminal-output` events; shell exit emits `terminal-exit`.
+#[tauri::command]
+fn terminal_open(
+    app: tauri::AppHandle,
+    state: State<'_, TerminalState>,
+    id: String,
+    cwd: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("Could not open a terminal: {e}"))?;
+
+    // The user's own shell, as a login shell so PATH (nvm, brew, …) is loaded.
+    let shell = if cfg!(target_os = "windows") {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+    };
+    let mut cmd = CommandBuilder::new(&shell);
+    #[cfg(unix)]
+    cmd.arg("-l");
+    let dir = PathBuf::from(&cwd);
+    if dir.is_dir() {
+        cmd.cwd(&dir);
+    }
+    cmd.env("TERM", "xterm-256color");
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Could not start the shell: {e}"))?;
+    drop(pair.slave); // release the slave end now the child holds it
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Could not read the terminal: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("Could not write to the terminal: {e}"))?;
+
+    // Pump PTY output → UI events until the shell exits.
+    let app2 = app.clone();
+    let id2 = id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = app2.emit(
+                        "terminal-output",
+                        TermData { id: id2.clone(), bytes: buf[..n].to_vec() },
+                    );
+                }
+            }
+        }
+        let _ = app2.emit("terminal-exit", id2.clone());
+    });
+
+    state
+        .0
+        .lock()
+        .unwrap()
+        .insert(id, TermSession { master: pair.master, writer, child });
+    Ok(())
+}
+
+/// Send keystrokes/input to a terminal session.
+#[tauri::command]
+fn terminal_write(state: State<'_, TerminalState>, id: String, data: String) -> Result<(), String> {
+    let mut map = state.0.lock().unwrap();
+    if let Some(s) = map.get_mut(&id) {
+        s.writer
+            .write_all(data.as_bytes())
+            .and_then(|_| s.writer.flush())
+            .map_err(|e| format!("Could not write to the terminal: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Resize a terminal session (after the xterm view is fitted/resized).
+#[tauri::command]
+fn terminal_resize(
+    state: State<'_, TerminalState>,
+    id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let map = state.0.lock().unwrap();
+    if let Some(s) = map.get(&id) {
+        s.master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| format!("Could not resize the terminal: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Close a terminal session and kill its shell.
+#[tauri::command]
+fn terminal_close(state: State<'_, TerminalState>, id: String) -> Result<(), String> {
+    if let Some(mut s) = state.0.lock().unwrap().remove(&id) {
+        let _ = s.child.kill();
+    }
+    Ok(())
 }
 
 // --- File explorer (read-only) ---------------------------------------------
@@ -2012,6 +3211,124 @@ async fn read_file_text(path: String) -> Result<FileContent, String> {
     .map_err(|e| format!("Reading the file failed unexpectedly: {e}"))?
 }
 
+/// Write UTF-8 text to a file (in-app editor save). Creates parent dirs.
+#[tauri::command]
+async fn write_file_text(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if let Some(dir) = p.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        }
+        fs::write(&p, content).map_err(|e| format!("Could not save {}: {e}", p.display()))
+    })
+    .await
+    .map_err(|e| format!("The save task failed unexpectedly: {e}"))?
+}
+
+/// One editor diagnostic (a syntax error/warning) for the gutter squiggles.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Diagnostic {
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+    /// "error" | "warning".
+    pub severity: String,
+}
+
+/// On-save syntax check for languages Monaco can't natively diagnose. Uses the
+/// language's own tool when present (Python → py_compile, Go → gofmt -e). Returns
+/// an empty list when the file is fine, the language is handled by Monaco, or the
+/// tool isn't installed (so it never blocks saving).
+#[tauri::command]
+async fn check_syntax(path: String) -> Result<Vec<Diagnostic>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "py" => Ok(check_python(&p)),
+            "go" => Ok(check_go(&p)),
+            _ => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|e| format!("The syntax check failed unexpectedly: {e}"))?
+}
+
+/// `python -m py_compile <file>` — catches syntax + indentation errors.
+fn check_python(p: &Path) -> Vec<Diagnostic> {
+    let py = if cfg!(target_os = "windows") { "python" } else { "python3" };
+    let out = match Command::new(py)
+        .args(["-m", "py_compile", &p.to_string_lossy()])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(), // python not installed → can't check
+    };
+    if out.status.success() {
+        return Vec::new();
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Pull the line number and the "SomethingError: message" out of the trace.
+    let line = text
+        .split(", line ")
+        .nth(1)
+        .or_else(|| text.split("line ").nth(1))
+        .and_then(|s| s.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    let message = text
+        .lines()
+        .rev()
+        .find(|l| l.contains("Error:") || l.contains("Error "))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| "Python syntax error.".to_string());
+    vec![Diagnostic { line, column: 1, message, severity: "error".into() }]
+}
+
+/// `gofmt -e <file>` — reports parse errors as `file:line:col: message`.
+fn check_go(p: &Path) -> Vec<Diagnostic> {
+    let out = match Command::new("gofmt")
+        .arg("-e")
+        .arg(p)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if out.status.success() {
+        return Vec::new();
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut diags = Vec::new();
+    for l in stderr.lines() {
+        // <path>:<line>:<col>: <message>
+        let parts: Vec<&str> = l.splitn(4, ':').collect();
+        if parts.len() == 4 {
+            let line = parts[1].trim().parse::<u32>().unwrap_or(1);
+            let column = parts[2].trim().parse::<u32>().unwrap_or(1);
+            diags.push(Diagnostic {
+                line,
+                column,
+                message: parts[3].trim().to_string(),
+                severity: "error".into(),
+            });
+        }
+    }
+    diags
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
@@ -2107,15 +3424,17 @@ fn home_dir(app: tauri::AppHandle) -> Result<String, String> {
 
 // --- Open in editor --------------------------------------------------------
 
-fn launch_cli_editor(cli: &str, mac_app: &str, path: &str) -> Result<(), String> {
-    if let Ok(status) = make_command(cli, &[path.to_string()]).status() {
+fn launch_cli_editor(cli: &str, mac_app: &str, args: &[String]) -> Result<(), String> {
+    if let Ok(status) = make_command(cli, args).status() {
         if status.success() {
             return Ok(());
         }
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(status) = Command::new("open").args(["-a", mac_app, path]).status() {
+        let mut open_args = vec!["-a".to_string(), mac_app.to_string()];
+        open_args.extend(args.iter().cloned());
+        if let Ok(status) = Command::new("open").args(&open_args).status() {
             if status.success() {
                 return Ok(());
             }
@@ -2126,18 +3445,33 @@ fn launch_cli_editor(cli: &str, mac_app: &str, path: &str) -> Result<(), String>
     ))
 }
 
-/// Open a project in the user's chosen editor.
+/// Editor args: open `folder` as the workspace, plus `file` to focus (if given).
+/// `code <folder> <file>` opens the folder as a project with the file in an editor.
+fn editor_args(folder: &str, file: &Option<String>) -> Vec<String> {
+    let mut v = vec![folder.to_string()];
+    if let Some(f) = file {
+        if !f.trim().is_empty() {
+            v.push(f.clone());
+        }
+    }
+    v
+}
+
+/// Open a project in the user's chosen editor. When `file` is given, the editor
+/// opens `path` as the workspace AND focuses that file.
 #[tauri::command]
-fn open_in_editor(path: String, editor: String) -> Result<(), String> {
+fn open_in_editor(path: String, editor: String, file: Option<String>) -> Result<(), String> {
     let p = PathBuf::from(&path);
     if !p.exists() {
         return Err(format!("The path \"{}\" no longer exists.", p.display()));
     }
+    let args = editor_args(&path, &file);
     match editor.as_str() {
-        "vscode" => open_in_vscode(path),
-        "cursor" => launch_cli_editor("cursor", "Cursor", &path),
-        "zed" => launch_cli_editor("zed", "Zed", &path),
-        "finder" => open_in_file_manager(path),
+        "vscode" => vscode_open(&args),
+        "cursor" => launch_cli_editor("cursor", "Cursor", &args),
+        "zed" => launch_cli_editor("zed", "Zed", &args),
+        // Finder can't "open as workspace" — reveal the file if given, else folder.
+        "finder" => open_in_file_manager(file.filter(|f| !f.trim().is_empty()).unwrap_or(path)),
         other => Err(format!("Unknown editor: {other}")),
     }
 }
@@ -2243,8 +3577,12 @@ fn open_in_vscode(path: String) -> Result<(), String> {
     if !p.exists() {
         return Err(format!("The path \"{}\" no longer exists.", p.display()));
     }
+    vscode_open(&[path])
+}
 
-    if let Ok(status) = make_command("code", &[path.clone()]).status() {
+/// Launch VS Code with one or more path args (`code <folder> [file]`).
+fn vscode_open(args: &[String]) -> Result<(), String> {
+    if let Ok(status) = make_command("code", args).status() {
         if status.success() {
             return Ok(());
         }
@@ -2252,10 +3590,9 @@ fn open_in_vscode(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(status) = Command::new("open")
-            .args(["-a", "Visual Studio Code", &path])
-            .status()
-        {
+        let mut open_args = vec!["-a".to_string(), "Visual Studio Code".to_string()];
+        open_args.extend(args.iter().cloned());
+        if let Ok(status) = Command::new("open").args(&open_args).status() {
             if status.success() {
                 return Ok(());
             }
@@ -2296,6 +3633,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .manage(PreviewState::default())
+        .manage(ClaudeState::default())
+        .manage(TerminalState::default())
         .invoke_handler(tauri::generate_handler![
             create_project,
             scan_projects,
@@ -2307,6 +3646,7 @@ pub fn run() {
             log_error,
             preview_status,
             install_deps,
+            install_preview_requirement,
             start_preview,
             stop_preview,
             load_organization,
@@ -2324,8 +3664,27 @@ pub fn run() {
             git_set_remote,
             git_log,
             git_clone,
+            git_diff,
+            git_remove_remote,
+            git_refs,
+            git_create_branch,
+            git_checkout,
+            git_delete_branch,
+            git_stashes,
+            git_stash_save,
+            git_stash_apply,
+            git_stash_drop,
+            check_tool,
+            run_claude_agent,
+            stop_claude,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
             read_dir,
             read_file_text,
+            write_file_text,
+            check_syntax,
             search_files,
             home_dir,
             open_in_editor,

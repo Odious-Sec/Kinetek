@@ -27,6 +27,8 @@ serde_json = "1"
 trash = "5"
 # OS keychain access for the user's AI API key (never stored in plaintext).
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# Real PTY for the in-app interactive terminal (so prompts/colors/TUIs work).
+portable-pty = "0.8"
 
 # Unix-only: signal a dev server's whole process group when stopping a preview.
 [target.'cfg(unix)'.dependencies]

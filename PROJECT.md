@@ -31,10 +31,18 @@ user. Heavy ones wrap their body in `spawn_blocking`. Arg names below are what
 the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params.
 
 ### Projects
-- `create_project(parentDir, projectName, templateId, summary, status, frameworks) -> ProjectInfo`
-  Takes the `AppHandle`. Runs the template's scaffolder (CLI or file-writer) and
-  **emits a `project-output` event per line** (`{line, stream}`) for the live
-  terminal. stdout/stderr also collected so failures report captured output.
+- `create_project(parentDir, projectName, appTemplateId, apiTemplateId?, databaseEngine?, summary, status, frameworks) -> ProjectInfo`
+  Takes the `AppHandle`. Assembles **app + optional API + optional database**:
+  - **Flat** (no API, no DB): scaffolds the app directly at `parent/<name>`
+    (the original single-template behavior).
+  - **Monorepo** (API and/or DB chosen): creates `<name>/`, then `app/`, `api/`,
+    `database/` inside it + a root `README.md`.
+  - `apply_scaffold(app, scaffold, run_dir, folder)` runs one part into a
+    subfolder (CLI tools create `run_dir/folder`; file generators write into it);
+    `write_files` is the shared file-writer; `database_files(engine)` emits the DB
+    placeholder (README + schema.sql/.md + .env.example + docker-compose for
+    server engines). **Emits `project-output` per line** for the live terminal.
+    Returns `ProjectInfo.stack = {app, api?, database?}`.
 - `scan_projects(dir) -> Vec<ProjectInfo>` — one level deep; a child dir counts
   as a project iff `detect_frameworks` finds something; skips dotdirs and
   `node_modules`. Sorted A→Z.
@@ -46,8 +54,56 @@ the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params
 
 ### Tooling / prerequisites
 - `check_prerequisites(templateId) -> Vec<Prerequisite>` — per `template_prereqs`.
+- `check_tool(key) -> Prerequisite` — single tool from the catalog (e.g.
+  "claude"); used to detect Claude Code.
 - `install_tool(toolKey) -> ()` — brew (macOS) / winget (Windows); manual-only
-  tools (Android Studio, Xcode) return an error pointing to a download URL.
+  tools (Android Studio, Xcode, Claude Code) return an error pointing to a URL.
+
+### Claude Code delegation
+- `run_claude_agent(app, state, runId, projectPath, prompt, mode) -> ()` — runs
+  the user's `claude` CLI headless (`claude -p <prompt> --output-format
+  stream-json --verbose --permission-mode <mode>`) in `projectPath`. stream-json
+  emits NDJSON events as they happen (init/assistant/tool_use/result) so the UI
+  shows activity immediately — default text mode buffers until the whole turn
+  ends (felt "stuck/slow to connect"). `ClaudePanel.parseStream` turns the events
+  into answer text + an activity strip (`$ cmd`, `✎ file`, `↳ read …`). `spawn_blocking` owns the run; the pid is tracked in
+  `ClaudeState(Arc<Mutex<HashMap<runId,pid>>>)`. stdout/stderr stream line-by-line
+  as `claude-output` events `{runId, line, stream}`; completion emits
+  `claude-done {runId, ok}`. `mode` ∈ plan | acceptEdits | default |
+  bypassPermissions (frontend offers plan/acceptEdits). Auth = the user's own
+  Claude Code sign-in; **Kinetek stores no key**. `ClaudePanel.tsx` injects a
+  `<kinetek-context>` snapshot (project + `gitStatus`/`gitChanges`) before the
+  user's prompt so the agent knows what's on screen, not just the files on disk.
+  In `ProjectPage` it's a **persistent resizable right dock** (header toggle +
+  drag handle, width clamped 320..body-360), so it stays open while you switch
+  the left tabs (Files/diff/source-control) — an IDE-style split, not a tab. The
+  dock has a **Claude Code | Terminal** segmented toggle (`DockView`): Claude
+  (`ClaudePanel`) or a PTY `TerminalView` rooted at the project (lazy-mounted on
+  first Terminal open via `termStarted`; both panels stay mounted, toggled with
+  `hidden`, so switching doesn't kill an agent run or shell). Claude output is
+  rendered by `Markdown.tsx` (dependency-free: headings/lists/blockquote/bold/
+  links/inline + fenced code highlighted via highlight.js → real React nodes,
+  safe), so it reads like a clean chat response rather than raw terminal text.
+- `stop_claude(state, runId) -> ()` — signals the process group (Unix).
+- Roadmap: an MCP server exposing Kinetek's state/actions for live two-way
+  context (the agent could query Kinetek and trigger its actions).
+
+### Interactive terminal (PTY)
+- Backed by **`portable-pty`** (Cargo) + **xterm.js** (`@xterm/xterm` +
+  `@xterm/addon-fit`). A real login shell, so prompts/colors/TUIs and interactive
+  installs (e.g. the Claude Code CLI) work.
+- `terminal_open(app, state, id, cwd, cols, rows) -> ()` — opens a PTY, spawns
+  `$SHELL -l` (or `%COMSPEC%`) with `TERM=xterm-256color` at `cwd`, and pumps
+  output as `terminal-output {id, bytes: Vec<u8>}` events; emits `terminal-exit`
+  on shell exit. Session stored in `TerminalState(Mutex<HashMap<id, TermSession>>)`
+  (`{master, writer, child}`).
+- `terminal_write(id, data)`, `terminal_resize(id, cols, rows)`,
+  `terminal_close(id)` (kills the shell).
+- `TerminalView.tsx` (xterm) is **lazy-loaded** in `App.tsx` (`React.lazy` +
+  `Suspense`) so xterm is a separate ~294 kB chunk, not in the startup bundle. It
+  decodes `bytes` → `Uint8Array` → `term.write`, sends `term.onData` →
+  `terminal_write`, and fits/resizes via `ResizeObserver` + `FitAddon`. cwd =
+  `settings.defaultDir` or `homeDir()`.
 
 ### Delete
 - `delete_project(path) -> ()` — move to Trash via `NSFileManager` (macOS) /
@@ -56,15 +112,28 @@ the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params
   for iCloud-evicted placeholders Finder won't trash.
 
 ### Preview (run locally)
-- `preview_status(projectPath) -> PreviewStatus` — detects a `dev`/`start`/
-  `serve` npm script (kind `"web"`, runner `"node"`) or `index.html` (kind
-  `"static"`); reports `nodeInstalled` and `needsInstall` (no node_modules).
+- `preview_status(projectPath) -> PreviewStatus` — recognizes web (a
+  `dev`/`start`/`serve` npm script → kind `"web"`, runner `"node"`), static
+  (`index.html` → `"static"`), and **.NET** (`.csproj`/`.sln` → `"dotnet"`, or
+  `"maui"` when the csproj references Maui/uses mobile target frameworks →
+  runner `"dotnet"`). Returns `requirements[]` (each a `PreviewRequirement`
+  `{key,name,satisfied,detail,installable,installLabel,url}`), `ready` (all
+  satisfied & deps installed), `needsInstall` (web node_modules missing), `how`
+  (what running will do), and `message` (friendly text when unsupported).
 - `install_deps(projectPath) -> ()` — `npm install`.
+- `install_preview_requirement(key) -> ()` — preview-only installs: `node`/
+  `dotnet` reuse `install_tool_inner` (brew/winget); `maui` runs `dotnet workload
+  install maui`. Errors are `friendly||KINETEK_DEV||raw` (`preview_error`).
 - `start_preview(projectPath) -> PreviewInfo` — takes `State<PreviewState>`.
-  Spawns the dev server (`npm run <script>`, env `BROWSER=none FORCE_COLOR=0`),
-  **scans stdout/stderr for the printed `http://localhost:PORT`** (90s timeout),
-  stores the `Child` in `PreviewState` (a `Mutex<HashMap<id, Child>>`), returns
-  `{id, url}`. The frontend then opens a `WebviewWindow` at that URL.
+  **web**: spawns the dev server (`npm run <script>`, env `BROWSER=none
+  FORCE_COLOR=0`), scans stdout/stderr for the printed `http://localhost:PORT`
+  (90s timeout), tracks the `Child` in `PreviewState`, returns `{id, url}` → the
+  frontend opens a `WebviewWindow`. **static**: returns a `file://` URL.
+  **.NET** (`start_dotnet_preview`): runs `dotnet build -nologo` (bounded); on
+  failure returns `friendly||KINETEK_DEV||raw` (`classify_dotnet_failure` maps
+  the build output to a plain reason); on success launches `dotnet run --no-build`
+  detached (app opens in its own window) and returns `{id, url:""}` (empty url =
+  native, no webview). The frontend (`PreviewDialog`) branches on `url`.
 - `stop_preview(id) -> ()` — `kill_tree`: on Unix the child is a process-group
   leader (`process_group(0)`), killed with `libc::kill(-pid, SIGTERM)` so the
   real server isn't orphaned.
@@ -100,10 +169,41 @@ the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params
   origin to the clean URL** so the token never lands in `.git/config`. Token
   scrubbed from errors. Returns a project card (frameworks via
   `detect_frameworks`).
+- `git_diff(path, file?) -> String` — unified diff of local changes vs `HEAD`
+  (staged + unstaged for tracked files; falls back to the index diff when there
+  are no commits). An untracked single file is synthesized as an all-added diff
+  so its contents still show. Rendered coloured by `DiffViewer`.
+- `git_remove_remote(path) -> ()` — drops the `origin` remote (used after the
+  GitHub repo is deleted); local files + history are kept.
+- `git_refs(path) -> GitRefs` — `{current, detached, branches[], remotes[],
+  tags[]}` (remotes exclude `*/HEAD`).
+- `git_create_branch(path, name, at?, checkout) -> ()` — `git branch`/`checkout
+  -b` [at a commit].
+- `git_checkout(path, reference) -> ()` — switch branch/ref; friendly error when
+  uncommitted changes conflict.
+- `git_delete_branch(path, name, force) -> ()` — `-d`/`-D`; friendly "not fully
+  merged" hint.
+- `git_stashes(path) -> Vec<StashEntry>` (`{index, message}`),
+  `git_stash_save(path, message?)` (`stash push --include-untracked`),
+  `git_stash_apply(path, index, pop)` (apply/pop), `git_stash_drop(path, index)`.
 
-### Files (read-only)
+### GitHub REST (`lib/github.ts`)
+- `getGithubRepo(token, slug)` — one repo's metadata (e.g. to read visibility).
+- `setGithubRepoVisibility(token, slug, isPrivate)` — PATCH `private` → updated repo.
+- `deleteGithubRepo(token, slug)` — DELETE; needs the **`delete_repo`** scope
+  (separate from `repo`) — a 403 is rethrown with that guidance. Callers also run
+  `git_remove_remote` so the project becomes "not connected" but keeps its files.
+- `gh()` returns `null` on `204 No Content` (DELETE) instead of parsing JSON.
+
+### Files
 - `read_dir(path) -> Vec<DirEntryInfo>` — folders first, A→Z; `hidden` flag for
   dotfiles.
+- `write_file_text(path, content) -> ()` — in-app editor save (creates parent dirs).
+- `check_syntax(path) -> Vec<Diagnostic>` — on-save syntax check for langs Monaco
+  can't natively diagnose: Python (`python -m py_compile`, catches syntax +
+  indentation) and Go (`gofmt -e`, parses → `file:line:col`). Returns `[]` when
+  fine, Monaco-handled (js/ts/json/css/html), or the tool is missing — never
+  blocks saving. `Diagnostic{line,column,message,severity}`.
 - `read_file_text(path) -> FileContent` — UTF-8 only; flags `binary`,
   `tooLarge`, `truncated`; caps ~2MB / 400k chars.
 - `search_files(root, query) -> Vec<SearchHit>` — recursive, case-insensitive
@@ -128,11 +228,13 @@ The TS mirrors live in `src/types.ts`. Keep them in lockstep by hand.
 
 | Rust (`lib.rs`)   | TS (`types.ts`)  | Fields (TS, camelCase) |
 |-------------------|------------------|------------------------|
-| `ProjectInfo`     | `Project`        | id, name, path, summary, status, frameworks[], hasPreview? |
+| `ProjectInfo`     | `Project`        | id, name, path, summary, status, frameworks[], hasPreview?, stack? |
+| `ProjectStack`    | `ProjectStack`   | app, api?, database? (set for assembled projects) |
 | `Prerequisite`    | `Prerequisite`   | key, name, required, installed, version, autoInstallable, installHint, url |
 | `GeneratedFile`   | `GeneratedFile`  | path, contents |
-| `PreviewStatus`   | `PreviewStatus`  | previewable, kind, runner, script, needsInstall, nodeInstalled, message |
-| `PreviewInfo`     | `PreviewInfo`    | id, url |
+| `PreviewRequirement` | `PreviewRequirement` | key, name, satisfied, detail, installable, installLabel, url |
+| `PreviewStatus`   | `PreviewStatus`  | previewable, kind, runner, script, needsInstall, requirements[], ready, message, how |
+| `PreviewInfo`     | `PreviewInfo`    | id, url (empty = native, no webview) |
 | `Folder`          | `Folder`         | id, name |
 | `Settings`        | `Settings`       | defaultDir, defaultEditor, aiProvider |
 | `Organization`    | `Organization`   | projects[], folders[], assignments{}, settings |
@@ -140,14 +242,18 @@ The TS mirrors live in `src/types.ts`. Keep them in lockstep by hand.
 | `GitStatus`       | `GitStatus`      | branch, dirty, ahead, behind, lastCommit, lastCommitRelative |
 | `GitChange`       | `GitChange`      | path, status |
 | `CommitInfo`      | `Commit`         | hash, shortHash, parents[], refs[], isHead, author, email, dateIso, dateRelative, subject, body |
+| `GitRefs`         | `GitRefs`        | current, detached, branches[], remotes[], tags[] |
+| `StashEntry`      | `StashEntry`     | index, message |
 | `DirEntryInfo`    | `DirEntry`       | name, path, isDir, hidden |
 | `FileContent`     | `FileContent`    | content, truncated, binary, tooLarge, size |
+| `Diagnostic`      | `Diagnostic`     | line, column, message, severity |
 | `SearchHit`       | `SearchHit`      | name, path, isDir, rel |
 
 `ProjectStatus` (TS only, the `status` string): `"Live" | "In Development" | "On Hold"`.
 
-Frontend-only types (no Rust mirror): `Template`, `Category`, `Purpose`,
-`WizardMode`, `AiProvider`.
+Frontend-only types (no Rust mirror): `Template` (now with `kinds: AppKind[]`,
+`platforms: Platform[]`, `scaffold`), `Category`, `Purpose`, `WizardMode`,
+`AiProvider`, `AppKind`, `Platform`, and `catalog.ts`'s `AppCategory`/`DatabaseOption`.
 
 ---
 
@@ -171,13 +277,22 @@ Frontend-only types (no Rust mirror): `Template`, `Category`, `Purpose`,
 - `projects: Project[]`, `folders: Folder[]`,
   `assignments: Record<projectId, folderId>`, `settings: Settings`
   — together they ARE the `Organization`.
-- `view: ViewMode` (`"dashboard" | "explorer" | "github"`) — primary page.
+- `view: ViewMode` (`"home" | "projects" | "explorer" | "github" | "terminal"`,
+  default `"home"`) — primary page. `home` = the `DashboardHome` widget board;
+  `projects` = the `Dashboard` grid (where the inspector + folders live);
+  `terminal` = the lazy-loaded `TerminalView`.
 - `selectedFolder: FolderSelection` (`"all" | "unfiled" | folderId`).
-- `inspectProject` — which project the right-side `ProjectPanel` shows (derived
-  live as `inspected` from `projects` by id, so it tracks edits and auto-closes
-  on delete).
-- `expandedId: string | null` — when set, `ProjectPage` (full page) takes over
-  the entire content area; `expanded` is derived live the same way.
+- `expandedId: string | null` — **selecting a project anywhere** (card or widget
+  row) sets this; `ProjectPage` (full page) then takes over the entire content
+  area. `expanded` is derived live from `projects` by id (tracks edits, clears on
+  delete). There is no side inspector — `ProjectPanel` was removed. `ProjectPage`'s
+  breadcrumb (`Projects › name`) calls `onBack` → clears `expandedId` + sets
+  `view="projects"`. Its **Files** tab detects `app`/`api`/`database` subfolders
+  (`readDir` on the root) and shows a part switcher that re-roots `FileBrowser`
+  (keyed so it remounts) for instant App/API/Database browsing; clicking a file
+  opens it in the lazy **Monaco `CodeEditor`** (edit + ⌘S save + diagnostics).
+  **Proceed to IDE** is a split button → `onOpenPath` (App's `handleOpenPath` →
+  `openInEditor`) for the whole project, the active part folder, or the file.
 - Dialog/transient flags: `wizardOpen`, `pendingDelete`, `pendingInstall`,
   `editingProject`, `settingsOpen`, `explainingId`, `scanning`, toasts.
 
@@ -195,19 +310,32 @@ also go to `logError` → the `kinetek-errors.log` file.
 ## 5. Key flows, step by step
 
 ### Create a project (wizard)
-Wizard (`ProjectWizard.tsx`) → either framework-first or goal-first
-(Category→Purpose→template). Details step (location prefilled from
-`settings.defaultDir`) → `handleBuild` attaches a `listen("project-output", …)`
-listener **before** invoking `create_project` (so no early lines are missed) →
-`RunningStep` renders the live auto-scrolling terminal (stderr amber) → on
-success the card is added; listener torn down in `finally` + on unmount.
+Two paths, both ending in a shared **stack → details → preflight → running** tail:
+- **Framework funnel:** `appType` (Web/Mobile/Desktop, `AppTypeStep`) →
+  `platform` (Mobile/Desktop only, `PlatformStep`) → `template`
+  (`TemplateStep`, list = `frameworksFor(kind, platform)`).
+- **Goal:** `category` → `purpose` (maps to an app template).
+Then **`StackStep`** — optionally add an API (framework) and/or a database
+(engine), both default "None". **Preflight** checks the *union* of app + API
+prereqs (`loadPrereqs(ids[])`, deduped by key). `handleBuild` attaches a
+`listen("project-output", …)` listener **before** invoking `create_project`
+(app → API → database stream in order) → `RunningStep` shows the live terminal →
+the card is added (with combined framework tags + `stack`). The flat-vs-monorepo
+layout is decided backend-side by whether an API/DB was chosen.
 
 ### Preview
-Card Preview button → `preview_status` → if `needsInstall`, a ConfirmDialog
-offers `install_deps` → `start_preview` → `openPreviewWindow` (a dedicated
-`WebviewWindow`). Closing the window → `stop_preview` (kills the dev server).
-Not previewable: mobile (Expo), CLI (Rust/Go), FastAPI/.NET — each returns a
-clear message.
+Card Preview button → App `setPreviewProject` → **`PreviewDialog`** (the single
+entry for all preview). It calls `preview_status`, lists the `requirements[]`
+(each satisfied or with a preview-only **Install** button →
+`install_preview_requirement`, or a **Get it** link), plus an `npm install` row
+when `needsInstall`. **Run** (enabled once `ready`) → `start_preview`:
+- web/static (`info.url` set) → `openPreviewWindow` (a `WebviewWindow`); closing
+  it → `stop_preview` (kills the dev server).
+- .NET (`info.url === ""`) → built cleanly and launched in its own window; the
+  dialog shows a "Built & launched" state.
+On any failure the dialog shows the friendly reason and the raw build/install
+output behind a "developer details" toggle (`splitPreviewError`). Genuinely
+unsupported kinds (Expo, Rust/Go CLI, FastAPI) show a plain message and no Run.
 
 ### AI explain a card
 ✨ button → `read_project_context` → `explainProject(provider, key, context)`
@@ -226,6 +354,29 @@ when no remote: Link existing (filterable `listGithubRepos`) or Create new
 first if needed).
 
 ---
+
+## 5a. The dashboard widget board
+
+`DashboardHome.tsx` (the `home` landing) is **registry-driven**: a local
+`widgets` array of `{ id, span, render }` mapped onto a `grid-cols-1
+lg:grid-cols-6` grid. `span` is a Tailwind col-span (e.g. `lg:col-span-2`).
+**To add a widget:** create a component under `components/widgets/`, then add one
+entry to that array — no other wiring.
+
+- All widgets share card chrome via `widgets/Widget.tsx` (`title`, optional
+  `icon`/`action`, body) and a clickable `widgets/ProjectRow.tsx`.
+- Current widgets: `QuickActionsWidget` (New/Scan/GitHub/Explorer),
+  `StatsWidget` (counts), `RecentProjectsWidget` (first 6, newest-first),
+  `NeedsAttentionWidget` (dirty or ahead), `ActivityWidget` (last 8 log entries
+  via `useSyncExternalStore` on `logStore`).
+- Git status for all real projects is fetched once by `hooks/useProjectStatuses.ts`
+  (`Promise.all` of `gitStatus`, keyed by project id, re-runs when the set of
+  paths changes, empty outside Tauri) and passed down to the widgets — so the
+  board makes N git calls on load, not N-per-widget.
+- Widget project rows call `onOpenProject` → App `setExpandedId` → full-page
+  `ProjectPage`. Quick actions switch `view` or open the wizard.
+- Roadmap: persisted layout / show-hide toggles / drag-reorder (the registry
+  shape is ready for it; not built yet).
 
 ## 6. The commit-graph algorithm
 
@@ -252,7 +403,15 @@ row height, then straight down) and node circles (filled if `isHead`). Constants
 `ROW_H=34`, `COL_W=16`, `PAD_X=14`. A detail pane (lg+) shows the selected
 commit's full message/body/author/date/parents/refs.
 
-Roadmap: per-commit changed files via `git show --stat`; branch checkout.
+Branches & stashes (our UI, Fork as feature-reference only): the History tab is
+`RefsSidebar` (collapsible Branches/Remotes/Tags/Stashes — create-branch,
+checkout, delete-branch, stash save/apply/pop/drop) beside `CommitGraph`, which
+has a **"Create branch here"** action in its detail pane (creates at the selected
+commit's hash and checks it out). Both take `refreshKey` + `onChanged`; ProjectPage
+holds a `gitRefreshKey` and `bumpGit()` so a mutation in one reloads the other.
+Remote rows checkout the DWIM short name (`origin/x` → `x`).
+
+Roadmap: per-commit changed files via `git show --stat`; merge/rebase; push new branch upstream.
 
 ---
 
@@ -277,6 +436,18 @@ Auth model recap: plain `git push` uses the user's own creds; GitHub-over-HTTPS
 uses the keychain token embedded in the URL **only at call time**, scrubbed from
 errors, never persisted. The user has two accounts (Odyssi-Sec primary,
 Odious-Sec secondary); the single keychain token decides which one is active.
+
+Connected-repo management (in `GitPanel`, once a project has an `origin`): it
+fetches `getGithubRepo` for the visibility badge, offers a **public/private
+toggle** (`setGithubRepoVisibility`), and a **Delete repo** action that calls
+`deleteGithubRepo` then `git_remove_remote` — the GitHub repo is gone but the
+local files/history remain and the project shows as "not connected." Delete needs
+the `delete_repo` token scope. New-repo creation already has a private/public
+choice. **Local changes diff:** in `ProjectPage`'s Source-control tab, GitPanel's
+changed-file rows are clickable (`onSelectChange`) and drive a `DiffViewer`
+(`git_diff`) in the right pane — so you see exactly what changed vs the last
+commit (what GitHub has). GitPanel renders without the diff pane in the narrow
+side inspector (no `onSelectChange`).
 
 ---
 
@@ -303,13 +474,22 @@ capability allow-list — **add a host there if you add a provider**.
 ## 9. Templates & scaffolding
 
 `src/lib/templates.ts` ids **must match** the `scaffold_for()` match arms in
-`lib.rs`. Current ids: `react-vite`, `vue-vite`, `svelte-vite`, `nextjs`,
-`react-native`, `node-express`, `aspnet-core`, `python-fastapi`, `rust-cli`,
-`go-module`, `static-web`. `template_prereqs(id)` declares required tools (node,
-rust, dotnet, python, plus manual-only Android Studio / Xcode for mobile).
-Scaffolders are either `Scaffold::Cli{program,args}` (runs the framework CLI) or
-`Scaffold::Files(files)` (writes a starter file set). "Build by goal" categories
-+ purposes live in `src/lib/categories.ts` and map a purpose → a template id.
+`lib.rs`. Each template carries `kinds: AppKind[]`, `platforms: Platform[]`, and
+`scaffold: "cli"|"files"|"placeholder"`. Current ids by category:
+- **web:** react-vite, vue-vite, svelte-vite, solid-vite, preact-vite,
+  vanilla-vite, nextjs, astro, angular, static-web
+- **mobile:** react-native (Expo), flutter, maui, android-native*, ios-native*
+- **desktop:** tauri, electron, maui, wpf, macos-native*
+- **api:** node-express, nestjs, python-fastapi, flask, aspnet-core, go-module
+- **tool:** rust-cli
+
+(*`placeholder` — Kinetek can't CLI-scaffold true-native Android/iOS/macOS, so it
+writes a starter folder + README pointing to Android Studio / Xcode. Everything
+else is a real `Scaffold::Cli`/`Scaffold::Files`.) `template_prereqs(id)` declares
+required tools (node/rust/dotnet/python/go/flutter + manual-only Android
+Studio/Xcode). The funnel catalog (`src/lib/catalog.ts`) is data-driven —
+**adding a framework = a `templates.ts` entry + a `scaffold_for` arm**, nothing
+else. "Build by goal" categories + purposes are separate (`src/lib/categories.ts`).
 
 ---
 

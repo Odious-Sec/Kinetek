@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Commit, Project } from "../types";
-import { gitLog } from "../lib/tauri";
-import { GitCommitIcon, RefreshIcon } from "./icons";
+import { gitCreateBranch, gitLog } from "../lib/tauri";
+import { CheckIcon, GitBranchIcon, GitCommitIcon, RefreshIcon, XIcon } from "./icons";
 
 /**
  * A Fork-style commit graph: each commit is a row; a coloured lane gutter on
@@ -135,11 +135,25 @@ function edgePath(e: Edge): string {
   return `M${x1} ${y1}C${x1} ${y1 + ROW_H / 2} ${x2} ${yb - ROW_H / 2} ${x2} ${yb}L${x2} ${y2}`;
 }
 
-export default function CommitGraph({ project }: { project: Project }) {
+interface Props {
+  project: Project;
+  /** Bumped by the parent to force a reload (e.g. after a branch action). */
+  refreshKey?: number;
+  /** Called after this view mutates git (so the refs sidebar refreshes too). */
+  onChanged?: () => void;
+  notify?: (kind: "ok" | "err", message: string) => void;
+}
+
+export default function CommitGraph({ project, refreshKey = 0, onChanged, notify }: Props) {
   const [commits, setCommits] = useState<Commit[] | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+
+  // "Create branch here" inline state (in the detail pane).
+  const [branching, setBranching] = useState(false);
+  const [branchName, setBranchName] = useState("");
+  const [branchBusy, setBranchBusy] = useState(false);
 
   const load = useMemo(
     () => () => {
@@ -159,8 +173,28 @@ export default function CommitGraph({ project }: { project: Project }) {
   useEffect(() => {
     setCommits(null);
     setSelected(null);
+    setBranching(false);
     load();
-  }, [load]);
+    // refreshKey forces a reload after external git changes.
+  }, [load, refreshKey]);
+
+  async function createBranchHere(hash: string) {
+    const name = branchName.trim();
+    if (!name) return;
+    setBranchBusy(true);
+    try {
+      await gitCreateBranch(project.path, name, hash, true);
+      notify?.("ok", `Created and switched to ${name}.`);
+      setBranching(false);
+      setBranchName("");
+      onChanged?.();
+      load();
+    } catch (e) {
+      notify?.("err", typeof e === "string" ? e : String(e));
+    } finally {
+      setBranchBusy(false);
+    }
+  }
 
   const graph = useMemo(() => (commits ? layout(commits) : null), [commits]);
   const sel = commits?.find((c) => c.hash === selected) ?? null;
@@ -305,6 +339,58 @@ export default function CommitGraph({ project }: { project: Project }) {
                 <Detail label="Refs" value={sel.refs.join(", ")} />
               )}
             </dl>
+
+            {/* Create branch at this commit */}
+            <div className="mt-4 border-t border-surface-border pt-3">
+              {branching ? (
+                <div className="flex items-center gap-1">
+                  <input
+                    autoFocus
+                    value={branchName}
+                    onChange={(e) => setBranchName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") createBranchHere(sel.hash);
+                      if (e.key === "Escape") {
+                        setBranching(false);
+                        setBranchName("");
+                      }
+                    }}
+                    placeholder="new-branch-name"
+                    spellCheck={false}
+                    className="w-full rounded-lg border border-accent/60 bg-surface-base px-2 py-1.5 font-mono text-[11px] text-slate-100 outline-none placeholder:text-slate-600"
+                  />
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => createBranchHere(sel.hash)}
+                    disabled={branchBusy || !branchName.trim()}
+                    className="shrink-0 rounded-lg bg-accent p-1.5 text-white hover:bg-accent-glow disabled:opacity-40"
+                  >
+                    <CheckIcon className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setBranching(false);
+                      setBranchName("");
+                    }}
+                    className="shrink-0 rounded-lg border border-surface-border p-1.5 text-slate-400 hover:bg-surface-hover"
+                  >
+                    <XIcon className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => {
+                    setBranching(true);
+                    setBranchName("");
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-2.5 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-surface-hover"
+                >
+                  <GitBranchIcon className="h-3.5 w-3.5" />
+                  Create branch here
+                </button>
+              )}
+            </div>
           </>
         ) : (
           <p className="text-xs text-slate-600">Select a commit.</p>

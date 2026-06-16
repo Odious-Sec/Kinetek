@@ -21,9 +21,12 @@ import type {
   PreviewInfo,
   PreviewStatus,
   Commit,
+  Diagnostic,
+  GitRefs,
   Project,
   ProjectContext,
   SearchHit,
+  StashEntry,
 } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 
@@ -51,6 +54,59 @@ export async function checkPrerequisites(
   templateId: string
 ): Promise<Prerequisite[]> {
   return invoke<Prerequisite[]>("check_prerequisites", { templateId });
+}
+
+/** Check a single tool from the catalog (e.g. "claude"). */
+export async function checkTool(key: string): Promise<Prerequisite> {
+  return invoke<Prerequisite>("check_tool", { key });
+}
+
+/** Claude Code permission mode: "plan" = safe/read-only, "acceptEdits" = can edit files. */
+export type ClaudeMode = "plan" | "acceptEdits";
+
+/**
+ * Delegate a prompt to the installed Claude Code CLI in a project's directory.
+ * Output streams via `claude-output` events; completion via `claude-done`
+ * (both carry `runId`). Uses the user's own Claude Code auth — no Kinetek secret.
+ */
+export async function runClaudeAgent(
+  runId: string,
+  projectPath: string,
+  prompt: string,
+  mode: ClaudeMode
+): Promise<void> {
+  return invoke("run_claude_agent", { runId, projectPath, prompt, mode });
+}
+
+/** Stop a running Claude Code agent by run id. */
+export async function stopClaude(runId: string): Promise<void> {
+  return invoke("stop_claude", { runId });
+}
+
+/** Open an interactive PTY shell rooted at `cwd`. Output streams via
+ *  `terminal-output` events; exit via `terminal-exit` (both carry the id). */
+export async function terminalOpen(
+  id: string,
+  cwd: string,
+  cols: number,
+  rows: number
+): Promise<void> {
+  return invoke("terminal_open", { id, cwd, cols, rows });
+}
+
+/** Send input/keystrokes to a terminal session. */
+export async function terminalWrite(id: string, data: string): Promise<void> {
+  return invoke("terminal_write", { id, data });
+}
+
+/** Resize a terminal session (after the xterm view is fitted). */
+export async function terminalResize(id: string, cols: number, rows: number): Promise<void> {
+  return invoke("terminal_resize", { id, cols, rows });
+}
+
+/** Close a terminal session and kill its shell. */
+export async function terminalClose(id: string): Promise<void> {
+  return invoke("terminal_close", { id });
 }
 
 /** Install a tool for the user via the platform package manager. */
@@ -202,6 +258,65 @@ export async function gitClone(
   return invoke<Project>("git_clone", { url, dest, token });
 }
 
+/** Local changes as a unified diff (whole tree, or one file) vs the last commit. */
+export async function gitDiff(path: string, file?: string): Promise<string> {
+  return invoke<string>("git_diff", { path, file });
+}
+
+/** Remove the `origin` remote (after deleting the GitHub repo); keeps files. */
+export async function gitRemoveRemote(path: string): Promise<void> {
+  return invoke("git_remove_remote", { path });
+}
+
+/** Branches, remote-tracking branches, and tags for the refs sidebar. */
+export async function gitRefs(path: string): Promise<GitRefs> {
+  return invoke<GitRefs>("git_refs", { path });
+}
+
+/** Create a branch (optionally at a commit, optionally checking it out). */
+export async function gitCreateBranch(
+  path: string,
+  name: string,
+  at?: string,
+  checkout = true
+): Promise<void> {
+  return invoke("git_create_branch", { path, name, at, checkout });
+}
+
+/** Switch to a branch/ref. */
+export async function gitCheckout(path: string, reference: string): Promise<void> {
+  return invoke("git_checkout", { path, reference });
+}
+
+/** Delete a local branch (force to discard unmerged commits). */
+export async function gitDeleteBranch(
+  path: string,
+  name: string,
+  force = false
+): Promise<void> {
+  return invoke("git_delete_branch", { path, name, force });
+}
+
+/** List saved stashes (most recent first). */
+export async function gitStashes(path: string): Promise<StashEntry[]> {
+  return invoke<StashEntry[]>("git_stashes", { path });
+}
+
+/** Stash the working tree (incl. untracked) so it isn't pushed yet. */
+export async function gitStashSave(path: string, message?: string): Promise<void> {
+  return invoke("git_stash_save", { path, message });
+}
+
+/** Apply a stash by index (pop also removes it from the list). */
+export async function gitStashApply(path: string, index: number, pop: boolean): Promise<void> {
+  return invoke("git_stash_apply", { path, index, pop });
+}
+
+/** Delete a stash by index. */
+export async function gitStashDrop(path: string, index: number): Promise<void> {
+  return invoke("git_stash_drop", { path, index });
+}
+
 /** Open a project in the chosen editor ("vscode" | "cursor" | "zed" | "finder"). */
 export async function openInEditor(path: string, editor: string): Promise<void> {
   return invoke("open_in_editor", { path, editor });
@@ -223,6 +338,16 @@ export async function readFileText(path: string): Promise<FileContent> {
   return invoke<FileContent>("read_file_text", { path });
 }
 
+/** Save UTF-8 text to a file (in-app editor). */
+export async function writeFileText(path: string, content: string): Promise<void> {
+  return invoke("write_file_text", { path, content });
+}
+
+/** On-save syntax check (Python/Go); empty when fine or unhandled by the backend. */
+export async function checkSyntax(path: string): Promise<Diagnostic[]> {
+  return invoke<Diagnostic[]>("check_syntax", { path });
+}
+
 /** Recursively find files/folders under root whose name matches the query. */
 export async function searchFiles(root: string, query: string): Promise<SearchHit[]> {
   return invoke<SearchHit[]>("search_files", { root, query });
@@ -236,6 +361,27 @@ export async function previewStatus(projectPath: string): Promise<PreviewStatus>
 /** Install a Node project's dependencies (`npm install`). */
 export async function installDeps(projectPath: string): Promise<void> {
   return invoke("install_deps", { projectPath });
+}
+
+/**
+ * Install a single preview requirement (preview-only): "node" / "dotnet" via the
+ * package manager, or "maui" via the .NET workload installer. Rejects with a
+ * `friendly||KINETEK_DEV||raw` string on failure (see splitPreviewError).
+ */
+export async function installPreviewRequirement(key: string): Promise<void> {
+  return invoke("install_preview_requirement", { key });
+}
+
+/** Separator the backend uses to pack a friendly message + raw dev detail. */
+export const PREVIEW_DEV_SEP = "||KINETEK_DEV||";
+
+/** Split a preview error into its friendly message and raw developer detail. */
+export function splitPreviewError(e: unknown): { friendly: string; dev: string } {
+  const s = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  const i = s.indexOf(PREVIEW_DEV_SEP);
+  return i === -1
+    ? { friendly: s, dev: "" }
+    : { friendly: s.slice(0, i), dev: s.slice(i + PREVIEW_DEV_SEP.length) };
 }
 
 /** Start a preview (dev server or static site); resolves with its URL + id. */

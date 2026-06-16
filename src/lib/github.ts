@@ -84,6 +84,7 @@ async function gh(token: string, path: string, init?: RequestInit): Promise<any>
     }
     throw new Error(`GitHub request failed (HTTP ${res.status})${msg ? `: ${msg}` : ""}`);
   }
+  if (res.status === 204) return null; // No Content (e.g. DELETE)
   return res.json();
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -134,4 +135,41 @@ export async function createGithubRepo(
     body: JSON.stringify({ name, private: isPrivate, auto_init: false }),
   });
   return toRepo(r);
+}
+
+/** Fetch a single repo's metadata by "owner/repo" slug (e.g. to read visibility). */
+export async function getGithubRepo(token: string, slug: string): Promise<GithubRepo> {
+  return toRepo(await gh(token, `/repos/${slug}`));
+}
+
+/** Flip a repo between private and public. Returns the updated repo. */
+export async function setGithubRepoVisibility(
+  token: string,
+  slug: string,
+  isPrivate: boolean
+): Promise<GithubRepo> {
+  const r = await gh(token, `/repos/${slug}`, {
+    method: "PATCH",
+    body: JSON.stringify({ private: isPrivate }),
+  });
+  return toRepo(r);
+}
+
+/**
+ * Permanently delete a repo on GitHub. The local clone is untouched — callers
+ * should also drop the local `origin` remote. Needs a token with the
+ * `delete_repo` scope (NOT included in plain `repo`).
+ */
+export async function deleteGithubRepo(token: string, slug: string): Promise<void> {
+  try {
+    await gh(token, `/repos/${slug}`, { method: "DELETE" });
+  } catch (e) {
+    const m = e instanceof Error ? e.message : String(e);
+    if (/403|denied|not accessible|forbidden/i.test(m)) {
+      throw new Error(
+        "Deleting a repo needs a classic token with the `delete_repo` scope (it's separate from `repo`). Add it at GitHub → Settings → Developer settings → Tokens (classic), then update your token in Kinetek."
+      );
+    }
+    throw e;
+  }
 }

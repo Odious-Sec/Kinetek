@@ -1,18 +1,26 @@
 import type { Template } from "../../types";
-import { TEMPLATES } from "../../lib/templates";
 import { CheckIcon } from "../icons";
 
-/** Framework-first step 1: pick a template to scaffold directly. */
+/** Framework step: pick a framework from the (already-filtered) list. */
 export default function TemplateStep({
+  templates,
   selected,
   onSelect,
 }: {
+  templates: Template[];
   selected: Template | null;
   onSelect: (t: Template) => void;
 }) {
+  if (templates.length === 0) {
+    return (
+      <p className="px-1 py-8 text-center text-sm text-slate-500">
+        No frameworks here yet — try another platform.
+      </p>
+    );
+  }
   return (
     <div className="grid grid-cols-1 gap-3 pt-2 sm:grid-cols-2">
-      {TEMPLATES.map((t) => {
+      {templates.map((t) => {
         const active = selected?.id === t.id;
         return (
           <button

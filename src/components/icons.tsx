@@ -251,6 +251,56 @@ export const ClockIcon = (p: IconProps) => (
   </svg>
 );
 
+export const BotIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="4" y="8" width="16" height="11" rx="2.5" />
+    <path d="M12 4v4M9 13h.01M15 13h.01M2 12v3M22 12v3" />
+  </svg>
+);
+
+export const TagIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z" />
+    <circle cx="7.5" cy="7.5" r="1.5" />
+  </svg>
+);
+
+export const ArchiveIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="4" rx="1" />
+    <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4" />
+  </svg>
+);
+
+export const LockIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="4.5" y="11" width="15" height="9" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+  </svg>
+);
+
+export const UnlockIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="4.5" y="11" width="15" height="9" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 7.5-2" />
+  </svg>
+);
+
+export const GitCompareIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="6" cy="6" r="2.5" />
+    <circle cx="18" cy="18" r="2.5" />
+    <path d="M6 8.5v7a3 3 0 0 0 3 3h3M18 15.5v-7a3 3 0 0 0-3-3h-3" />
+    <path d="m9 9-2.5-2.5M15 15l2.5 2.5" />
+  </svg>
+);
+
+export const PlayIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M7 4.5v15l13-7.5z" />
+  </svg>
+);
+
 export const InfoIcon = (p: IconProps) => (
   <svg {...base(p)}>
     <circle cx="12" cy="12" r="9" />

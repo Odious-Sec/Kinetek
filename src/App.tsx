@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import type { Folder, Project, Settings } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import TitleBar from "./components/TitleBar";
 import Dashboard from "./components/Dashboard";
+import DashboardHome from "./components/DashboardHome";
 import Sidebar, { type FolderSelection, type ViewMode } from "./components/Sidebar";
 import Explorer from "./components/Explorer";
 import GithubPage from "./components/GithubPage";
-import ProjectPanel from "./components/ProjectPanel";
 import ProjectPage from "./components/ProjectPage";
 import ProjectWizard from "./components/ProjectWizard";
+import PreviewDialog from "./components/PreviewDialog";
 import ConfirmDialog from "./components/ConfirmDialog";
 import EditProjectDialog from "./components/EditProjectDialog";
 import SettingsDialog from "./components/SettingsDialog";
@@ -20,22 +21,21 @@ import {
   deleteProject,
   deleteProjectPermanently,
   getSecret,
-  installDeps,
   isTauri,
   loadOrganization,
   logError,
   logInfo,
   openInEditor,
   openInFileManager,
-  openPreviewWindow,
   pickDirectory,
-  previewStatus,
   readProjectContext,
   saveOrganization,
   scanProjects,
-  startPreview,
 } from "./lib/tauri";
 import { SAMPLE_PROJECTS } from "./lib/sampleData";
+
+// xterm is heavy — only load it when the Terminal page is opened.
+const TerminalView = lazy(() => import("./components/TerminalView"));
 
 type Toast = { id: number; kind: "ok" | "err"; message: string };
 
@@ -47,20 +47,18 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
-  const [pendingInstall, setPendingInstall] = useState<Project | null>(null);
-  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewProject, setPreviewProject] = useState<Project | null>(null);
 
   // In-app organization (virtual folders + project→folder assignments).
   const [folders, setFolders] = useState<Folder[]>([]);
   const [assignments, setAssignments] = useState<Record<string, string>>({});
   const [selectedFolder, setSelectedFolder] = useState<FolderSelection>("all");
-  const [view, setView] = useState<ViewMode>("dashboard");
+  const [view, setView] = useState<ViewMode>("home");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [orgLoaded, setOrgLoaded] = useState(false);
 
   // Editing + settings + AI.
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [inspectProject, setInspectProject] = useState<Project | null>(null);
   // Full-page project view (id so it tracks edits/deletes).
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -209,6 +207,23 @@ export default function App() {
     [notify, settings.defaultEditor]
   );
 
+  // Open an arbitrary path (project root, a part folder, or a file) in the editor.
+  const handleOpenPath = useCallback(
+    async (path: string) => {
+      if (!isTauri()) {
+        notify("err", "Opening an editor is only available in the desktop app.");
+        return;
+      }
+      try {
+        await openInEditor(path, settings.defaultEditor);
+        notify("ok", `Opening in ${settings.defaultEditor}…`);
+      } catch (e) {
+        notify("err", typeof e === "string" ? e : String(e));
+      }
+    },
+    [notify, settings.defaultEditor]
+  );
+
   const handleReveal = useCallback(
     async (project: Project) => {
       if (!isTauri()) return;
@@ -221,70 +236,17 @@ export default function App() {
     [notify]
   );
 
-  // Start the dev server (or static site) and open it in a dedicated window.
-  const launchPreview = useCallback(
-    async (project: Project) => {
-      notify("ok", `Starting ${project.name} preview… (first run may take a moment)`);
-      try {
-        const info = await startPreview(project.path);
-        await openPreviewWindow(project, info);
-      } catch (e) {
-        const msg = typeof e === "string" ? e : String(e);
-        notify("err", msg);
-      }
-    },
-    [notify]
-  );
-
+  // Open the unified preview dialog (checks requirements, installs, runs).
   const handlePreview = useCallback(
-    async (project: Project) => {
+    (project: Project) => {
       if (!isTauri()) {
         notify("err", "Preview is only available in the desktop app.");
         return;
       }
-      try {
-        const status = await previewStatus(project.path);
-        if (!status.previewable) {
-          notify("err", status.message);
-          return;
-        }
-        if (status.runner === "node" && !status.nodeInstalled) {
-          notify(
-            "err",
-            "Node.js is required to preview this project. Install it (e.g. from the New Project flow) and try again."
-          );
-          return;
-        }
-        if (status.needsInstall) {
-          // "Tell me, let me confirm" — surface an install confirmation.
-          setPendingInstall(project);
-          return;
-        }
-        await launchPreview(project);
-      } catch (e) {
-        notify("err", typeof e === "string" ? e : String(e));
-      }
+      setPreviewProject(project);
     },
-    [notify, launchPreview]
+    [notify]
   );
-
-  const handleConfirmInstall = useCallback(async () => {
-    if (!pendingInstall) return;
-    const project = pendingInstall;
-    setPreviewBusy(true);
-    try {
-      await installDeps(project.path);
-      setPendingInstall(null);
-      notify("ok", `Installed dependencies for ${project.name}.`);
-      await launchPreview(project);
-    } catch (e) {
-      const msg = typeof e === "string" ? e : String(e);
-      notify("err", msg);
-      setPendingInstall(null);
-    } finally {
-      setPreviewBusy(false);
-    }
-  }, [pendingInstall, notify, launchPreview]);
 
   const handleCreated = useCallback((project: Project) => {
     setProjects((prev) => [project, ...prev.filter((p) => p.id !== project.id)]);
@@ -396,12 +358,8 @@ export default function App() {
     }
   }, [pendingDelete, notify]);
 
-  // The live version of the inspected project (refreshes on edit, clears on delete).
-  const inspected = inspectProject
-    ? projects.find((p) => p.id === inspectProject.id) ?? null
-    : null;
-
-  // Live version of the full-page (expanded) project.
+  // Live version of the full-page (expanded) project — refreshes on edit,
+  // clears on delete. Selecting a project anywhere opens this page directly.
   const expanded = expandedId
     ? projects.find((p) => p.id === expandedId) ?? null
     : null;
@@ -425,8 +383,11 @@ export default function App() {
         {expanded ? (
           <ProjectPage
             project={expanded}
-            onBack={() => setExpandedId(null)}
-            onOpenInEditor={handleProceedToCode}
+            onBack={() => {
+              setExpandedId(null);
+              setView("projects");
+            }}
+            onOpenPath={handleOpenPath}
             notify={notify}
           />
         ) : (
@@ -443,8 +404,28 @@ export default function App() {
               onDelete={deleteFolder}
             />
             <div className="min-h-0 min-w-0 flex-1">
-              {view === "explorer" ? (
+              {view === "home" ? (
+                <DashboardHome
+                  projects={projects}
+                  onNewProject={() => setWizardOpen(true)}
+                  onScanFolder={handleScanFolder}
+                  onOpenGithub={() => setView("github")}
+                  onOpenExplorer={() => setView("explorer")}
+                  onOpenProjects={() => setView("projects")}
+                  onOpenProject={(p) => setExpandedId(p.id)}
+                />
+              ) : view === "explorer" ? (
                 <Explorer initialRoot={settings.defaultDir ?? ""} notify={notify} />
+              ) : view === "terminal" ? (
+                <Suspense
+                  fallback={
+                    <div className="flex h-full items-center justify-center text-sm text-slate-600">
+                      Loading terminal…
+                    </div>
+                  }
+                >
+                  <TerminalView cwd={settings.defaultDir ?? ""} />
+                </Suspense>
               ) : view === "github" ? (
                 <GithubPage
                   notify={notify}
@@ -456,7 +437,7 @@ export default function App() {
                 <Dashboard
                   projects={projects}
                   scanning={scanning}
-                  narrow={!!inspected}
+                  narrow={false}
                   folders={folders}
                   assignments={assignments}
                   selectedFolder={selectedFolder}
@@ -470,21 +451,10 @@ export default function App() {
                   onAssignFolder={assignFolder}
                   onEdit={setEditingProject}
                   onExplain={handleExplain}
-                  onSelect={setInspectProject}
+                  onSelect={(p) => setExpandedId(p.id)}
                 />
               )}
             </div>
-            {inspected && view === "dashboard" && (
-              <div className="min-h-0 w-[34%] min-w-[20rem] max-w-[40rem] shrink-0 animate-slide-in-right">
-                <ProjectPanel
-                  project={inspected}
-                  onClose={() => setInspectProject(null)}
-                  onOpenInEditor={handleProceedToCode}
-                  onExpand={(p) => setExpandedId(p.id)}
-                  notify={notify}
-                />
-              </div>
-            )}
           </>
         )}
       </div>
@@ -554,15 +524,11 @@ export default function App() {
         />
       )}
 
-      {pendingInstall && (
-        <ConfirmDialog
-          title={`Install dependencies for ${pendingInstall.name}?`}
-          message="This project's dependencies aren't installed yet. Kinetek can run npm install (this can take a minute), then start the preview."
-          detail={pendingInstall.path}
-          confirmLabel="Install & preview"
-          busy={previewBusy}
-          onConfirm={handleConfirmInstall}
-          onCancel={() => (previewBusy ? undefined : setPendingInstall(null))}
+      {previewProject && (
+        <PreviewDialog
+          project={previewProject}
+          onClose={() => setPreviewProject(null)}
+          notify={notify}
         />
       )}
 

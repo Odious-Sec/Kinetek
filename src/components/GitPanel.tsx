@@ -9,6 +9,7 @@ import {
   gitInit,
   gitPush,
   gitRemote,
+  gitRemoveRemote,
   gitSetRemote,
   gitStatus,
   openUrl,
@@ -16,8 +17,11 @@ import {
 } from "../lib/tauri";
 import {
   createGithubRepo,
+  deleteGithubRepo,
+  getGithubRepo,
   getGithubUser,
   listGithubRepos,
+  setGithubRepoVisibility,
   type GithubRepo,
 } from "../lib/github";
 import {
@@ -25,24 +29,36 @@ import {
   ExternalLinkIcon,
   GitBranchIcon,
   KeyIcon,
+  LockIcon,
   PlusIcon,
   RefreshIcon,
   SearchIcon,
+  TrashIcon,
+  UnlockIcon,
   UploadIcon,
 } from "./icons";
 
 interface Props {
   project: Project;
   notify: (kind: "ok" | "err", message: string) => void;
+  /** When provided, changed files become clickable (drives a diff pane). */
+  selectedChange?: string | null;
+  onSelectChange?: (path: string) => void;
 }
 
 /** Source control + GitHub account connection for one project. */
-export default function GitPanel({ project, notify }: Props) {
+export default function GitPanel({ project, notify, selectedChange, onSelectChange }: Props) {
   const [status, setStatus] = useState<GitStatus | null | "loading">("loading");
   const [changes, setChanges] = useState<GitChange[]>([]);
   const [remote, setRemote] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Connected repo metadata (for visibility + delete).
+  const [repoInfo, setRepoInfo] = useState<GithubRepo | null>(null);
+  const [visBusy, setVisBusy] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   // Token (null = loading, "" = none).
   const [token, setToken] = useState<string | null>(null);
@@ -78,11 +94,28 @@ export default function GitPanel({ project, notify }: Props) {
     setMessage("");
     setShowConnect("none");
     setNewName(project.name);
+    setConfirmingDelete(false);
+    setRepoInfo(null);
     refresh();
     getSecret(GITHUB_TOKEN_KEY)
       .then((t) => setToken(t ?? ""))
       .catch(() => setToken(""));
   }, [project.path, project.name, refresh]);
+
+  // Once connected with a valid token, fetch the repo's visibility metadata.
+  useEffect(() => {
+    if (!remote || !token || ghUser === "invalid" || ghUser === "loading" || ghUser === null) {
+      setRepoInfo(null);
+      return;
+    }
+    let cancelled = false;
+    getGithubRepo(token, remote)
+      .then((r) => !cancelled && setRepoInfo(r))
+      .catch(() => !cancelled && setRepoInfo(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [remote, token, ghUser]);
 
   // Validate the token → show the connected account.
   useEffect(() => {
@@ -207,6 +240,38 @@ export default function GitPanel({ project, notify }: Props) {
     }
   }
 
+  async function toggleVisibility() {
+    if (!token || !remote || !repoInfo) return;
+    setVisBusy(true);
+    try {
+      const updated = await setGithubRepoVisibility(token, remote, !repoInfo.private);
+      setRepoInfo(updated);
+      notify("ok", `${remote} is now ${updated.private ? "private" : "public"}.`);
+    } catch (e) {
+      notify("err", asMsg(e));
+    } finally {
+      setVisBusy(false);
+    }
+  }
+
+  // Delete the repo on GitHub but keep the local files + history.
+  async function deleteRemoteRepo() {
+    if (!token || !remote) return;
+    setDeleteBusy(true);
+    try {
+      await deleteGithubRepo(token, remote);
+      await gitRemoveRemote(project.path);
+      setConfirmingDelete(false);
+      setRepoInfo(null);
+      notify("ok", `Deleted ${remote} on GitHub. Your local files are untouched.`);
+      await refresh();
+    } catch (e) {
+      notify("err", asMsg(e));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   if (status === "loading" || token === null) {
     return (
       <div className="flex h-full items-center justify-center text-xs text-slate-600">
@@ -299,6 +364,64 @@ export default function GitPanel({ project, notify }: Props) {
               <div className="truncate text-slate-500">
                 {remote ? `→ ${remote}` : "Not connected to a GitHub repo yet"}
               </div>
+
+              {/* Visibility + delete controls for the connected repo */}
+              {remote && (
+                <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                  {repoInfo && (
+                    <button
+                      onClick={toggleVisibility}
+                      disabled={visBusy}
+                      title={`Make ${repoInfo.private ? "public" : "private"}`}
+                      className="inline-flex items-center gap-1 rounded-md border border-surface-border bg-surface-card px-2 py-1 text-[11px] font-medium text-slate-300 transition-colors hover:bg-surface-hover disabled:opacity-50"
+                    >
+                      {visBusy ? (
+                        <RefreshIcon className="h-3 w-3 animate-spin" />
+                      ) : repoInfo.private ? (
+                        <LockIcon className="h-3 w-3 text-amber-300" />
+                      ) : (
+                        <UnlockIcon className="h-3 w-3 text-emerald-300" />
+                      )}
+                      {repoInfo.private ? "Private" : "Public"}
+                      <span className="text-slate-500">· make {repoInfo.private ? "public" : "private"}</span>
+                    </button>
+                  )}
+                  {repoInfo?.htmlUrl && (
+                    <button
+                      onClick={() => openUrl(repoInfo.htmlUrl)}
+                      className="inline-flex items-center gap-1 rounded-md border border-surface-border bg-surface-card px-2 py-1 text-[11px] font-medium text-slate-300 transition-colors hover:bg-surface-hover"
+                    >
+                      <ExternalLinkIcon className="h-3 w-3" /> Open
+                    </button>
+                  )}
+                  {!confirmingDelete ? (
+                    <button
+                      onClick={() => setConfirmingDelete(true)}
+                      className="inline-flex items-center gap-1 rounded-md border border-surface-border bg-surface-card px-2 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
+                    >
+                      <TrashIcon className="h-3 w-3" /> Delete repo
+                    </button>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200">
+                      Delete on GitHub? (local files kept)
+                      <button
+                        onClick={deleteRemoteRepo}
+                        disabled={deleteBusy}
+                        className="font-semibold text-rose-300 hover:underline disabled:opacity-50"
+                      >
+                        {deleteBusy ? "Deleting…" : "Yes"}
+                      </button>
+                      <button
+                        onClick={() => setConfirmingDelete(false)}
+                        disabled={deleteBusy}
+                        className="text-slate-400 hover:text-slate-200"
+                      >
+                        Cancel
+                      </button>
+                    </span>
+                  )}
+                </div>
+              )}
             </>
           ) : (
             <div className="flex items-center justify-between gap-2">
@@ -431,16 +554,33 @@ export default function GitPanel({ project, notify }: Props) {
             </p>
             {dirty ? (
               <div className="space-y-0.5">
-                {changes.map((c) => (
-                  <div key={c.path} className="flex items-center gap-2 text-xs">
-                    <span className="w-16 shrink-0 text-[10px] uppercase text-slate-500">
-                      {c.status}
-                    </span>
-                    <span className="truncate font-mono text-slate-300" title={c.path}>
-                      {c.path}
-                    </span>
-                  </div>
-                ))}
+                {changes.map((c) =>
+                  onSelectChange ? (
+                    <button
+                      key={c.path}
+                      onClick={() => onSelectChange(c.path)}
+                      className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs transition-colors ${
+                        selectedChange === c.path ? "bg-accent/15" : "hover:bg-surface-hover"
+                      }`}
+                    >
+                      <span className="w-16 shrink-0 text-[10px] uppercase text-slate-500">
+                        {c.status}
+                      </span>
+                      <span className="truncate font-mono text-slate-300" title={c.path}>
+                        {c.path}
+                      </span>
+                    </button>
+                  ) : (
+                    <div key={c.path} className="flex items-center gap-2 text-xs">
+                      <span className="w-16 shrink-0 text-[10px] uppercase text-slate-500">
+                        {c.status}
+                      </span>
+                      <span className="truncate font-mono text-slate-300" title={c.path}>
+                        {c.path}
+                      </span>
+                    </div>
+                  )
+                )}
               </div>
             ) : (
               <p className="text-xs text-slate-600">

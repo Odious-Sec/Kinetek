@@ -1,9 +1,14 @@
 name: Build desktop apps
 
 # Builds native Windows and Linux installers on GitHub's runners (a Mac can't
-# cross-compile a Tauri app for them). Run it by hand from the Actions tab
-# ("Run workflow"), or push a tag like `v0.1.0`. The installers are uploaded as
-# downloadable artifacts on the run — no public release is created.
+# cross-compile a Tauri app for them).
+#
+# Two ways to run it:
+#   • Manually from the Actions tab ("Run workflow") → installers are uploaded
+#     as downloadable artifacts on the run (good for test builds).
+#   • Push a version tag like `v0.1.0` → same build, PLUS a published GitHub
+#     Release with all the installers attached. Send your friend the release
+#     URL — they download directly, no GitHub account needed (public repo).
 on:
   workflow_dispatch:
   push:
@@ -12,6 +17,9 @@ on:
 
 jobs:
   build:
+    permissions:
+      # Required so the build can create/update the Release on a tag push.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,15 +65,31 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Builds the frontend (via beforeBuildCommand) + the native bundle.
+      # Builds the frontend (via beforeBuildCommand) + the native bundle. On a
+      # tag push, `tagName` is set, so tauri-action also creates/updates a single
+      # Release for that tag and uploads each platform's installers to it. On a
+      # manual run, `tagName` is empty → it just builds (artifacts handle that).
       - name: Build the app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: "Kinetek ${{ github.ref_name }}"
+          releaseBody: |
+            Desktop builds of Kinetek.
 
-      # The installers land under src-tauri/target/release/bundle/* :
-      #   Linux   → deb/, rpm/, appimage/
-      #   Windows → msi/, nsis/
+            **Windows** — run `Kinetek_*-setup.exe` (or the `.msi`). Unsigned, so
+            Windows SmartScreen will warn: click **More info → Run anyway**.
+
+            **Linux** — easiest is the `.AppImage`: `chmod +x Kinetek_*.AppImage`
+            then run it (no install). `.deb` (Debian/Ubuntu) and `.rpm` (Fedora)
+            are also attached.
+          releaseDraft: false
+          prerelease: false
+
+      # Also keep installers as run artifacts, so manual (non-tag) runs still
+      # produce something downloadable.
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:

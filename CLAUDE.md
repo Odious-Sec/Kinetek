@@ -41,16 +41,21 @@ resume**.
   on the empty state. Added `UserIcon` to `icons.tsx`. Kept the not-installed UI,
   MODES, Stop, Markdown render.
 
-### 2. Kinetek-aware CLAUDE.md with predefined part paths (do this next)
-An option to drop a project **`CLAUDE.md`** that's pre-seeded
-with the part layout so Claude Code auto-knows where to work — the `app/`,
-`api/`, `database/` paths (from `ProjectInfo.stack` at creation + the detected
-parts on disk) and a note that it should operate in those folders unless told
-otherwise. Likely a one-click action (similar to "Generate context docs") that
-writes a structured root `CLAUDE.md` from Kinetek's known structure (no LLM
-needed for the path scaffold), optionally enriched by Claude. Open question the
-user raised: *where* the canonical Kinetek CLAUDE.md lives and how it ties into
-the app↔API contract docs — decide alongside.
+### 2. ✅ DONE — Kinetek-aware CLAUDE.md with predefined part paths
+The **Context docs** button on the Files tab (`buildContextDocs` in
+`ProjectPage.tsx`) writes a **root `CLAUDE.md`** pre-seeded with the part layout
+(the detected `app/`/`api/`/`database/` paths + a "work in the matching folder,
+leave the others alone" directive) so Claude Code auto-discovers where to work,
+plus a per-part `CLAUDE.md`. Pure scaffold from Kinetek's known structure — **no
+LLM**, instant, works without Claude Code. Possible follow-on (not built):
+optional Claude **enrichment** of the scaffold, and reconciling with the
+Claude-driven `DOCS_PROMPT`/`CONTRACT_PROMPT` in `ClaudePanel` (which also write
+`CLAUDE.md`/`CONTRACT.md`) so the two paths don't clobber each other confusingly.
+
+### Next up (pick from the roadmap)
+No scoped task is queued — see **Roadmap / open ideas** at the bottom. Strong
+candidates: branch checkout from the commit graph, per-commit changed-files in
+History, or multi-account GitHub support.
 
 ## What Kinetek is
 
@@ -196,10 +201,11 @@ Both must be clean before you call something done. For a shippable bundle:
   assembled projects) re-roots the tree to `app/`/`api/`/`database/`, and clicking
   a file opens it in the **Monaco `CodeEditor`** — edit + save with live syntax
   diagnostics. The Files toolbar also has a **Context docs** button (shown when
-  the project has app/api/database parts): one click writes a root `CONTEXT.md`
-  mapping the parts + a `CLAUDE.md` inside each part folder, scaffolded from
-  Kinetek's known structure via `buildContextDocs` (**no LLM** — instant, works
-  without Claude Code; overwrites existing files). Header has a split **Proceed
+  the project has app/api/database parts): one click writes a **root `CLAUDE.md`**
+  mapping the parts (named `CLAUDE.md` so Claude Code auto-loads it and discovers
+  the layout) + a `CLAUDE.md` inside each part folder, scaffolded from Kinetek's
+  known structure via `buildContextDocs` (**no LLM** — instant, works without
+  Claude Code; overwrites existing files). Header has a split **Proceed
   to IDE** (▾ menu: whole project, the active part folder, or **"Open this file"**
   = opens the part folder as the workspace *with the file focused* via
   `open_in_editor(folder, editor, file)`), plus a **Preview** button (previews
@@ -330,7 +336,11 @@ One file, grouped by feature. Command catalog (all registered in
   back to `origin/<branch>`** when no upstream is configured — so unpushed commits
   still show as "N to push" in `GitPanel`/Overview after a Kinetek push, which
   doesn't set tracking refs), `git_changes`, `git_remote`, `git_commit`,
-  `git_push` (token-auth HTTPS, **token scrubbed from errors**), `git_init`,
+  `git_push` (token-auth HTTPS, **token scrubbed from errors**), `git_fetch`
+  (updates `origin/*` refs via an explicit refspec so behind/ahead counts
+  populate; doesn't touch the tree), `git_pull` (**fast-forward only** — friendly
+  error on divergence instead of a surprise merge; both token-authed + scrubbed),
+  `git_init`,
   `git_set_remote`, `git_log` (commit graph), `git_clone` (token scrubbed from
   saved remote + errors), `git_diff(path, file?)` (local changes vs HEAD;
   untracked files synthesized as all-added), `git_remove_remote` (drop origin
@@ -471,7 +481,8 @@ Kinetek targets all three. The backend is `cfg`-gated throughout — keep it tha
 ## Roadmap / open ideas (not yet built)
 
 - Per-commit changed-files (`git show --stat`) in the History detail pane.
-- Branch checkout/switch from the graph; pull/fetch in GitPanel.
+- Branch checkout/switch from the graph. (Pull/fetch in GitPanel: **done** —
+  `git_fetch`/`git_pull` + Fetch/Pull buttons with ahead/behind indicators.)
 - "Clone all" bulk action on the GitHub page.
 - Multi-account GitHub support.
 - Optional disk-managed folders (real `mkdir`/`mv`, permission-gated) — the

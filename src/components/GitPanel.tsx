@@ -6,7 +6,9 @@ import {
   getSecret,
   gitChanges,
   gitCommit,
+  gitFetch,
   gitInit,
+  gitPull,
   gitPush,
   gitRemote,
   gitRemoveRemote,
@@ -26,6 +28,7 @@ import {
 } from "../lib/github";
 import {
   CheckIcon,
+  DownloadIcon,
   ExternalLinkIcon,
   GitBranchIcon,
   KeyIcon,
@@ -240,6 +243,35 @@ export default function GitPanel({ project, notify, selectedChange, onSelectChan
     }
   }
 
+  // Refresh remote-tracking refs (so the behind count updates) without changing
+  // any local files.
+  async function fetchRemote() {
+    setBusy(true);
+    try {
+      await gitFetch(project.path, token ?? "");
+      await refresh();
+      notify("ok", "Fetched from origin.");
+    } catch (e) {
+      notify("err", asMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Fast-forward pull the current branch from origin.
+  async function pull() {
+    setBusy(true);
+    try {
+      await gitPull(project.path, token ?? "");
+      notify("ok", `Pulled the latest into ${project.name}.`);
+      await refresh();
+    } catch (e) {
+      notify("err", asMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function toggleVisibility() {
     if (!token || !remote || !repoInfo) return;
     setVisBusy(true);
@@ -284,6 +316,7 @@ export default function GitPanel({ project, notify, selectedChange, onSelectChan
   const isRepo = status !== null;
   const dirty = changes.length > 0;
   const ahead = isRepo ? status.ahead : 0;
+  const behind = isRepo ? status.behind : 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -354,16 +387,31 @@ export default function GitPanel({ project, notify, selectedChange, onSelectChan
               <div className="flex items-center gap-1.5 font-mono text-slate-300">
                 <GitBranchIcon className="h-3.5 w-3.5 text-slate-500" />
                 {status.branch}
-                {(status.ahead > 0 || status.behind > 0) && (
+                {(ahead > 0 || behind > 0) && (
                   <span className="text-slate-500">
-                    {status.ahead > 0 && `↑${status.ahead}`}{" "}
-                    {status.behind > 0 && `↓${status.behind}`}
+                    {ahead > 0 && `↑${ahead}`}{" "}
+                    {behind > 0 && `↓${behind}`}
                   </span>
+                )}
+                {remote && (
+                  <button
+                    onClick={fetchRemote}
+                    disabled={busy}
+                    title="Fetch from origin (updates the ahead/behind counts; doesn't change your files)"
+                    className="ml-auto inline-flex items-center gap-1 rounded-md border border-surface-border bg-surface-card px-1.5 py-0.5 text-[10px] font-medium text-slate-400 transition-colors hover:bg-surface-hover hover:text-slate-200 disabled:opacity-50"
+                  >
+                    <RefreshIcon className={`h-3 w-3 ${busy ? "animate-spin" : ""}`} /> Fetch
+                  </button>
                 )}
               </div>
               <div className="truncate text-slate-500">
                 {remote ? `→ ${remote}` : "Not connected to a GitHub repo yet"}
               </div>
+              {behind > 0 && (
+                <p className="mt-1 text-[11px] text-amber-300/90">
+                  {behind} commit{behind === 1 ? "" : "s"} on origin you don't have — pull to catch up.
+                </p>
+              )}
 
               {/* Visibility + delete controls for the connected repo */}
               {remote && (
@@ -614,13 +662,22 @@ export default function GitPanel({ project, notify, selectedChange, onSelectChan
               {busy ? "Working…" : "Commit & Push"}
             </button>
             <button
+              onClick={pull}
+              disabled={busy || !remote}
+              title="Pull the latest from origin (fast-forward only)"
+              className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <DownloadIcon className="h-3.5 w-3.5" />
+              Pull{behind > 0 ? ` ↓${behind}` : ""}
+            </button>
+            <button
               onClick={pushOnly}
               disabled={busy || !remote || (ahead === 0 && !dirty)}
               title="Push already-committed changes"
               className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-40"
             >
               <UploadIcon className="h-3.5 w-3.5" />
-              Push
+              Push{ahead > 0 ? ` ↑${ahead}` : ""}
             </button>
           </div>
         </div>

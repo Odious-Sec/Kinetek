@@ -2304,6 +2304,84 @@ async fn git_push(path: String, token: String) -> Result<(), String> {
     .map_err(|e| format!("The push task failed unexpectedly: {e}"))?
 }
 
+/// Fetch from origin without touching the working tree. Updates the local
+/// `origin/*` tracking refs (so `git_status`'s behind/ahead counts populate).
+/// When a GitHub token is given it's used for private-repo auth, never echoed.
+#[tauri::command]
+async fn git_fetch(path: String, token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let remote_url = run_git(&p, &["remote", "get-url", "origin"])
+            .map_err(|_| "No 'origin' remote is configured for this project.".to_string())?;
+        let remote_url = remote_url.trim();
+        let token = token.trim();
+
+        let result = if !token.is_empty() && remote_url.contains("github.com") {
+            let slug = parse_repo_slug(remote_url);
+            let auth = format!("https://{token}@github.com/{slug}.git");
+            // Fetching from an explicit URL would only write FETCH_HEAD, so map
+            // the refs into `origin/*` ourselves to keep tracking refs current.
+            run_git(&p, &["fetch", &auth, "+refs/heads/*:refs/remotes/origin/*"])
+        } else {
+            run_git(&p, &["fetch", "origin"])
+        };
+
+        result.map(|_| ()).map_err(|e| {
+            let scrubbed = if token.is_empty() { e } else { e.replace(token, "***") };
+            format!("Fetch failed: {scrubbed}")
+        })
+    })
+    .await
+    .map_err(|e| format!("The fetch task failed unexpectedly: {e}"))?
+}
+
+/// Pull the current branch from origin, **fast-forward only** so it never
+/// creates a surprise merge commit. If the branch has diverged, it fails with a
+/// plain-English message pointing the user to resolve it in a terminal. The
+/// token (for private GitHub repos) is never returned in error text.
+#[tauri::command]
+async fn git_pull(path: String, token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = PathBuf::from(&path);
+        if !p.join(".git").exists() {
+            return Err("This project isn't a git repository.".to_string());
+        }
+        let branch = run_git(&p, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map_err(|e| format!("Could not read the branch: {e}"))?;
+        let branch = branch.trim();
+        let remote_url = run_git(&p, &["remote", "get-url", "origin"])
+            .map_err(|_| "No 'origin' remote is configured for this project.".to_string())?;
+        let remote_url = remote_url.trim();
+        let token = token.trim();
+
+        let result = if !token.is_empty() && remote_url.contains("github.com") {
+            let slug = parse_repo_slug(remote_url);
+            let auth = format!("https://{token}@github.com/{slug}.git");
+            run_git(&p, &["pull", "--ff-only", &auth, branch])
+        } else {
+            run_git(&p, &["pull", "--ff-only", "origin", branch])
+        };
+
+        result.map(|_| ()).map_err(|e| {
+            let scrubbed = if token.is_empty() { e } else { e.replace(token, "***") };
+            // Translate the common fast-forward refusal into something plain.
+            if scrubbed.contains("Not possible to fast-forward")
+                || scrubbed.contains("non-fast-forward")
+                || scrubbed.contains("diverging")
+            {
+                "Your local branch and origin have both moved on (diverged). Commit or stash your work, then merge/rebase in a terminal — Kinetek only does safe fast-forward pulls.".to_string()
+            } else {
+                format!("Pull failed: {scrubbed}")
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("The pull task failed unexpectedly: {e}"))?
+}
+
 /// Initialize a git repo (default branch `main`) if one doesn't exist.
 #[tauri::command]
 async fn git_init(path: String) -> Result<(), String> {
@@ -3961,6 +4039,8 @@ pub fn run() {
             git_remote,
             git_commit,
             git_push,
+            git_fetch,
+            git_pull,
             git_init,
             git_set_remote,
             git_log,

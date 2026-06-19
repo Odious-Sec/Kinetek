@@ -234,6 +234,16 @@ export async function gitPush(path: string, token: string): Promise<void> {
   return invoke("git_push", { path, token });
 }
 
+/** Fetch origin (updates `origin/*` refs; doesn't touch the working tree). */
+export async function gitFetch(path: string, token: string): Promise<void> {
+  return invoke("git_fetch", { path, token });
+}
+
+/** Pull the current branch from origin (fast-forward only). */
+export async function gitPull(path: string, token: string): Promise<void> {
+  return invoke("git_pull", { path, token });
+}
+
 /** Initialize a git repo in the project folder (if not already one). */
 export async function gitInit(path: string): Promise<void> {
   return invoke("git_init", { path });

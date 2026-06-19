@@ -195,20 +195,25 @@ Both must be clean before you call something done. For a shippable bundle:
   tab is an **IDE-style editor**: an **App / API / Database** part switcher (for
   assembled projects) re-roots the tree to `app/`/`api/`/`database/`, and clicking
   a file opens it in the **Monaco `CodeEditor`** — edit + save with live syntax
-  diagnostics. Header has a split **Proceed to IDE** (▾ menu: whole project, the
-  active part folder, or **"Open this file"** = opens the part folder as the
-  workspace *with the file focused* via `open_in_editor(folder, editor, file)`),
-  plus a **Preview** button (previews the `app/` part for assembled projects, else
-  the root, through `PreviewDialog`).
+  diagnostics. The Files toolbar also has a **Context docs** button (shown when
+  the project has app/api/database parts): one click writes a root `CONTEXT.md`
+  mapping the parts + a `CLAUDE.md` inside each part folder, scaffolded from
+  Kinetek's known structure via `buildContextDocs` (**no LLM** — instant, works
+  without Claude Code; overwrites existing files). Header has a split **Proceed
+  to IDE** (▾ menu: whole project, the active part folder, or **"Open this file"**
+  = opens the part folder as the workspace *with the file focused* via
+  `open_in_editor(folder, editor, file)`), plus a **Preview** button (previews
+  the `app/` part for assembled projects, else the root, through `PreviewDialog`).
   The Source-control tab is a **two-pane git workspace**: `GitPanel` on the left,
   a `DiffViewer` of the selected change filling the rest (uses the full width).
   The History tab is `RefsSidebar` (branches/remotes/tags/stashes) + `CommitGraph`.
-  The right side is a **persistent, resizable dock** (toggled from the header,
-  drag handle to resize) that stays put while you switch the left tabs — an
-  IDE-style split. The dock has a **Claude Code | Terminal** segmented toggle:
-  Claude Code (`ClaudePanel`) or a PTY `TerminalView` rooted at the project
-  (lazy-mounted on first open; both kept mounted so switching doesn't kill a
-  run/shell).
+  The right side is a **resizable dock** — **scoped to the Files tab** (the
+  Claude Code header toggle only shows there, so the agent's context is the files
+  you're viewing). It's kept mounted but hidden (`display: contents` ↔ `hidden`)
+  on the other tabs so a running chat/shell survives tab switches. The dock has a
+  **Claude Code | Terminal** segmented toggle: Claude Code (`ClaudePanel`) or a
+  PTY `TerminalView` rooted at the project (lazy-mounted on first open; both kept
+  mounted so switching doesn't kill a run/shell).
 - `CommitGraph.tsx` — **Fork-style commit graph** (SVG lanes/merges) for the
   History tab. See "Commit graph" below.
 - `Markdown.tsx` — tiny dependency-free Markdown renderer (headings, lists,
@@ -321,7 +326,10 @@ One file, grouped by feature. Command catalog (all registered in
   then launch), `stop_preview` (`kill_tree`, process-group kill on Unix).
 - **Persistence/secrets:** `load_organization`/`save_organization` (JSON in
   app **config dir**, keyed by bundle id), `set/get/delete_secret` (keychain).
-- **Git (local):** `git_status`, `git_changes`, `git_remote`, `git_commit`,
+- **Git (local):** `git_status` (ahead/behind vs the upstream `@{u}`, **falling
+  back to `origin/<branch>`** when no upstream is configured — so unpushed commits
+  still show as "N to push" in `GitPanel`/Overview after a Kinetek push, which
+  doesn't set tracking refs), `git_changes`, `git_remote`, `git_commit`,
   `git_push` (token-auth HTTPS, **token scrubbed from errors**), `git_init`,
   `git_set_remote`, `git_log` (commit graph), `git_clone` (token scrubbed from
   saved remote + errors), `git_diff(path, file?)` (local changes vs HEAD;

@@ -2112,14 +2112,22 @@ async fn git_status(project_path: String) -> Result<Option<GitStatus>, String> {
             .map(|s| !s.is_empty())
             .unwrap_or(false);
 
-        // "<ahead> <behind>" relative to the upstream (if one is configured).
+        // "<ahead> <behind>" relative to the upstream if one is configured.
+        // When the branch has no upstream tracking (common right after a push
+        // through Kinetek, which doesn't set tracking refs), fall back to
+        // comparing against `origin/<branch>` so unpushed commits still show.
+        let parse_counts = |s: String| {
+            let mut it = s.split_whitespace();
+            let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0u32);
+            let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0u32);
+            (a, b)
+        };
         let (ahead, behind) = run(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])
-            .map(|s| {
-                let mut it = s.split_whitespace();
-                let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-                (a, b)
+            .or_else(|| {
+                let range = format!("HEAD...origin/{branch}");
+                run(&["rev-list", "--left-right", "--count", &range])
             })
+            .map(parse_counts)
             .unwrap_or((0, 0));
 
         Ok(Some(GitStatus {

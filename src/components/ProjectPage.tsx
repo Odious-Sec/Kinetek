@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import type { DirEntry, GitStatus, Project } from "../types";
-import { gitStatus, openInFileManager, readDir } from "../lib/tauri";
+import { gitStatus, openInFileManager, readDir, writeFileText } from "../lib/tauri";
 import FileBrowser from "./FileBrowser";
 import CommitGraph from "./CommitGraph";
 import RefsSidebar from "./RefsSidebar";
@@ -23,6 +23,7 @@ import {
   GitCommitIcon,
   InfoIcon,
   ServerIcon,
+  SparkIcon,
   TerminalIcon,
   XIcon,
 } from "./icons";
@@ -63,6 +64,9 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
   const [tab, setTab] = useState<Tab>("overview");
   const [ideMenuOpen, setIdeMenuOpen] = useState(false);
   const [showHidden, setShowHidden] = useState(false);
+  // Bumped after writing files so the file tree re-reads from disk.
+  const [filesRefreshKey, setFilesRefreshKey] = useState(0);
+  const [docsBusy, setDocsBusy] = useState(false);
   const [selected, setSelected] = useState<DirEntry | null>(null);
   const [selectedChange, setSelectedChange] = useState<string | null>(null);
   // Monorepo parts (app/api/database) for the IDE-style file switcher.
@@ -156,6 +160,26 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
     ? { ...project, path: appPart.path, name: `${project.name} · app` }
     : project;
 
+  // One-click context docs: a root CONTEXT.md mapping the parts + a CLAUDE.md in
+  // each part folder. Scaffolded from Kinetek's known structure (no LLM) so it's
+  // instant and works even without Claude Code installed.
+  async function writeContextDocs() {
+    if (docsBusy) return;
+    setDocsBusy(true);
+    try {
+      const docs = buildContextDocs(project, parts);
+      await Promise.all(docs.map((d) => writeFileText(d.path, d.content)));
+      setFilesRefreshKey((k) => k + 1);
+      notify("ok", `Wrote ${docs.length} context file${docs.length === 1 ? "" : "s"}.`);
+    } catch (e) {
+      notify("err", typeof e === "string" ? e : String(e));
+    } finally {
+      setDocsBusy(false);
+    }
+  }
+  // Show the docs button once we know the project has at least one known part.
+  const canWriteDocs = parts.length > 0;
+
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "overview", label: "Overview", icon: <InfoIcon className="h-4 w-4" /> },
     { id: "files", label: "Files", icon: <FileIcon className="h-4 w-4" /> },
@@ -198,18 +222,22 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            <button
-              onClick={() => setClaudeOpen((o) => !o)}
-              title="Toggle the Claude Code panel"
-              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                claudeOpen
-                  ? "border-accent/60 bg-accent/15 text-accent-soft"
-                  : "border-surface-border bg-surface-card text-slate-200 hover:bg-surface-hover"
-              }`}
-            >
-              <BotIcon className="h-3.5 w-3.5" />
-              Claude Code
-            </button>
+            {/* Claude Code lives with the Files tab so its context (the files
+                you're viewing) is unambiguous — hidden on the other tabs. */}
+            {tab === "files" && (
+              <button
+                onClick={() => setClaudeOpen((o) => !o)}
+                title="Toggle the Claude Code panel"
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  claudeOpen
+                    ? "border-accent/60 bg-accent/15 text-accent-soft"
+                    : "border-surface-border bg-surface-card text-slate-200 hover:bg-surface-hover"
+                }`}
+              >
+                <BotIcon className="h-3.5 w-3.5" />
+                Claude Code
+              </button>
+            )}
             {/* Proceed to IDE — opens the whole project, or the part/file you're in */}
             <div className="relative">
               <div className="flex">
@@ -302,15 +330,28 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
             </button>
           ))}
           {tab === "files" && (
-            <label className="ml-auto inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-slate-500">
-              <input
-                type="checkbox"
-                checked={showHidden}
-                onChange={(e) => setShowHidden(e.target.checked)}
-                className="h-3 w-3 accent-accent"
-              />
-              Show hidden
-            </label>
+            <div className="ml-auto flex items-center gap-3">
+              {canWriteDocs && (
+                <button
+                  onClick={writeContextDocs}
+                  disabled={docsBusy}
+                  title="Write a root CONTEXT.md mapping the parts + a CLAUDE.md inside each part folder"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-[11px] font-medium text-accent-soft transition-colors hover:bg-accent/15 disabled:opacity-50"
+                >
+                  <SparkIcon className="h-3.5 w-3.5" />
+                  {docsBusy ? "Writing…" : "Context docs"}
+                </button>
+              )}
+              <label className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-slate-500">
+                <input
+                  type="checkbox"
+                  checked={showHidden}
+                  onChange={(e) => setShowHidden(e.target.checked)}
+                  className="h-3 w-3 accent-accent"
+                />
+                Show hidden
+              </label>
+            </div>
           )}
         </div>
       </div>
@@ -350,7 +391,7 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
               )}
               <div className="min-h-0 flex-1 overflow-hidden p-2">
                 <FileBrowser
-                  key={filePartPath ?? project.path}
+                  key={`${filePartPath ?? project.path}:${filesRefreshKey}`}
                   root={filePartPath ?? project.path}
                   showHidden={showHidden}
                   selectedPath={selected?.path ?? null}
@@ -448,9 +489,11 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
         )}
         </div>
 
-        {/* Resizable Claude Code dock — stays on the right while you work */}
+        {/* Resizable Claude Code dock — tied to the Files tab. Kept mounted (so a
+            running chat/terminal survives) but hidden on the other tabs via
+            `display: contents` ↔ `hidden`. */}
         {claudeOpen && (
-          <>
+          <div className={tab === "files" ? "contents" : "hidden"}>
             <div
               onMouseDown={startDrag}
               title="Drag to resize"
@@ -504,11 +547,92 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
                 </div>
               )}
             </div>
-          </>
+          </div>
         )}
       </div>
     </div>
   );
+}
+
+/** A part's one-line role, used across the generated docs. */
+const PART_ROLE: Record<string, string> = {
+  app: "the user-facing application (frontend / client)",
+  api: "the backend service the app talks to (endpoints + data)",
+  database: "the data layer — schema, migrations, seed data",
+};
+
+/**
+ * Scaffold context docs from Kinetek's known structure (no LLM): a root
+ * CONTEXT.md mapping the parts and a CLAUDE.md inside each part folder. Returns
+ * the files to write; pure so it's easy to reason about.
+ */
+function buildContextDocs(
+  project: Project,
+  parts: ProjectPart[]
+): { path: string; content: string }[] {
+  const has = (n: string) => parts.some((p) => p.name === n);
+  const stack = project.frameworks.length ? project.frameworks.join(", ") : "not detected";
+  const summary =
+    project.summary?.trim() || "_No summary yet — use “Explain” on the project to generate one._";
+
+  // Root CONTEXT.md — the map of how the parts fit together.
+  const partRows = parts
+    .map((p) => `| **${p.label}** | \`${p.name}/\` | ${PART_ROLE[p.name] ?? "project part"} |`)
+    .join("\n");
+  const connect =
+    has("app") && has("api")
+      ? "\n## How the parts connect\n\nThe **app** (`app/`) calls the **API** (`api/`). Treat the API as the source of truth for endpoints and data shapes, and keep the app's calls in sync with it. Each side's `CLAUDE.md` points back here.\n"
+      : "";
+  const root = `# ${project.name} — project context
+
+> Auto-generated by Kinetek. A map of how this project's parts fit together.
+> Regenerate any time from the **Files** tab → **Context docs**.
+
+${summary}
+
+**Stack:** ${stack}
+
+## Parts
+
+| Part | Folder | What it is |
+|------|--------|------------|
+${partRows}
+${connect}
+## Where to work
+
+${parts.map((p) => `- \`${p.name}/\` — ${PART_ROLE[p.name] ?? "this part"} (see \`${p.name}/CLAUDE.md\`).`).join("\n")}
+`;
+
+  const docs = [{ path: `${project.path}/CONTEXT.md`, content: root }];
+
+  // A CLAUDE.md inside each part folder with that part's context.
+  for (const p of parts) {
+    const others = parts.filter((o) => o.name !== p.name);
+    const rel =
+      others.length > 0
+        ? `\n## Related parts\n\n${others
+            .map((o) => `- \`../${o.name}/\` — ${PART_ROLE[o.name] ?? "another part"}.`)
+            .join("\n")}\n\nThe full map is in [\`../CONTEXT.md\`](../CONTEXT.md).\n`
+        : "";
+    docs.push({
+      path: `${p.path}/CLAUDE.md`,
+      content: `# ${p.label} — ${project.name}
+
+> Auto-generated by Kinetek. Agent context for the \`${p.name}/\` part.
+
+This is **${PART_ROLE[p.name] ?? "a part"}** of **${project.name}**.
+
+**Stack:** ${stack}
+
+## Working in this folder
+
+- Keep changes scoped to \`${p.name}/\` unless a task explicitly spans parts.
+${p.name === "app" && has("api") ? "- When you call the API, match the shapes the `api/` part exposes (see `../CONTEXT.md`).\n" : ""}${p.name === "api" && has("app") ? "- The `app/` part depends on these endpoints — keep them backward-compatible or update the app in lockstep.\n" : ""}- Document key entry points and conventions here as the code grows.
+${rel}`,
+    });
+  }
+
+  return docs;
 }
 
 function IdeMenuItem({

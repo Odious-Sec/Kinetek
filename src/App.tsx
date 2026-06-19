@@ -10,6 +10,7 @@ import GithubPage from "./components/GithubPage";
 import ProjectPage from "./components/ProjectPage";
 import ProjectWizard from "./components/ProjectWizard";
 import PreviewDialog from "./components/PreviewDialog";
+import Onboarding from "./components/Onboarding";
 import ConfirmDialog from "./components/ConfirmDialog";
 import EditProjectDialog from "./components/EditProjectDialog";
 import SettingsDialog from "./components/SettingsDialog";
@@ -18,8 +19,10 @@ import { AlertIcon, CheckIcon, XIcon } from "./components/icons";
 import { AI_PROVIDERS, secretKeyFor } from "./lib/ai";
 import { explainProject } from "./lib/generate";
 import {
+  GITHUB_TOKEN_KEY,
   deleteProject,
   deleteProjectPermanently,
+  deleteSecret,
   getSecret,
   isTauri,
   loadOrganization,
@@ -225,6 +228,27 @@ export default function App() {
     [notify, settings.defaultEditor]
   );
 
+  // Wipe everything stored on this device: the saved workspace (projects,
+  // folders, settings) and all secrets (AI keys + GitHub token), then return to
+  // first-run setup.
+  const handleReset = useCallback(async () => {
+    if (isTauri()) {
+      await Promise.all([
+        ...AI_PROVIDERS.map((p) => deleteSecret(secretKeyFor(p.id)).catch(() => {})),
+        deleteSecret(GITHUB_TOKEN_KEY).catch(() => {}),
+      ]);
+    }
+    setProjects(isTauri() ? [] : SAMPLE_PROJECTS);
+    setFolders([]);
+    setAssignments({});
+    setSelectedFolder("all");
+    setExpandedId(null);
+    setView("home");
+    setSettingsOpen(false);
+    setSettings({ ...DEFAULT_SETTINGS, onboarded: false });
+    notify("ok", "Kinetek has been reset to first-run.");
+  }, [notify]);
+
   const handleReveal = useCallback(
     async (project: Project) => {
       if (!isTauri()) return;
@@ -365,6 +389,9 @@ export default function App() {
     ? projects.find((p) => p.id === expandedId) ?? null
     : null;
 
+  // First-run setup (desktop only; wait for the load so it doesn't flash).
+  const needsOnboarding = isTauri() && orgLoaded && !settings.onboarded;
+
   // Folder names already on disk, so the GitHub page can mark repos as "saved".
   const localNames = useMemo(
     () =>
@@ -381,7 +408,9 @@ export default function App() {
       <TitleBar onOpenSettings={() => setSettingsOpen(true)} />
 
       <div className="flex min-h-0 flex-1">
-        {expanded ? (
+        {needsOnboarding ? (
+          <Onboarding settings={settings} onComplete={setSettings} notify={notify} />
+        ) : expanded ? (
           <ProjectPage
             project={expanded}
             onBack={() => {
@@ -486,6 +515,7 @@ export default function App() {
           settings={settings}
           onSave={setSettings}
           onClose={() => setSettingsOpen(false)}
+          onReset={handleReset}
           notify={notify}
         />
       )}

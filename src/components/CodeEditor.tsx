@@ -3,6 +3,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { monaco } from "../lib/monaco";
 import type { DirEntry } from "../types";
 import { checkSyntax, readFileText, writeFileText } from "../lib/tauri";
+import { shortcut } from "../lib/platform";
 import { ExternalLinkIcon, FileIcon, RefreshIcon } from "./icons";
 
 /** File extension → Monaco language id. */
@@ -142,7 +143,7 @@ export default function CodeEditor({
           >
             {saving ? <RefreshIcon className="h-3 w-3 animate-spin" /> : null}
             {saving ? "Saving…" : "Save"}
-            <span className="text-white/60">⌘S</span>
+            <span className="text-white/60">{shortcut("S")}</span>
           </button>
         )}
         <button

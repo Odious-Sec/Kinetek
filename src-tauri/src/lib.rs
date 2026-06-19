@@ -151,6 +151,9 @@ pub struct Settings {
     pub default_editor: String,
     /// AI provider id (see src/lib/ai.ts).
     pub ai_provider: String,
+    /// Whether the first-run setup has been completed.
+    #[serde(default)]
+    pub onboarded: bool,
 }
 
 impl Default for Settings {
@@ -159,6 +162,7 @@ impl Default for Settings {
             default_dir: None,
             default_editor: "vscode".into(),
             ai_provider: "gemini".into(),
+            onboarded: false,
         }
     }
 }
@@ -2846,6 +2850,7 @@ async fn run_claude_agent(
     project_path: String,
     prompt: String,
     mode: String,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     let path = PathBuf::from(&project_path);
     if !path.is_dir() {
@@ -2861,7 +2866,7 @@ async fn run_claude_agent(
     // Clone the Arc so the blocking worker (which owns the run) can update it.
     let pids = state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        run_claude_inner(app, pids, run_id, path, prompt, mode)
+        run_claude_inner(app, pids, run_id, path, prompt, mode, session_id)
     })
     .await
     .map_err(|e| format!("The Claude task failed unexpectedly: {e}"))?
@@ -2874,22 +2879,28 @@ fn run_claude_inner(
     path: PathBuf,
     prompt: String,
     mode: String,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     // Stream JSON events (NDJSON) so the UI shows activity as it happens — the
     // default text mode buffers until the whole turn finishes (feels "stuck").
     // `--verbose` is required for stream-json in print mode.
-    let mut cmd = make_command(
-        "claude",
-        &[
-            "-p".to_string(),
-            prompt,
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--permission-mode".to_string(),
-            mode,
-        ],
-    );
+    let mut args = vec![
+        "-p".to_string(),
+        prompt,
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--permission-mode".to_string(),
+        mode,
+    ];
+    // Resume the existing Claude Code session so the conversation keeps its
+    // memory across turns. Absent/empty → a fresh session (the CLI mints one,
+    // whose id comes back to the UI in the stream-json `init`/`result` events).
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        args.push("--resume".to_string());
+        args.push(sid);
+    }
+    let mut cmd = make_command("claude", &args);
     cmd.current_dir(&path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -3005,7 +3016,11 @@ fn terminal_open(
     let shell = if cfg!(target_os = "windows") {
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
     } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+        // Default macOS shell is zsh; default Linux shell is bash. `$SHELL` is set
+        // in any real desktop session, so the fallback is only a last resort.
+        std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") { "/bin/zsh".into() } else { "/bin/bash".into() }
+        })
     };
     let mut cmd = CommandBuilder::new(&shell);
     #[cfg(unix)]
@@ -3488,6 +3503,125 @@ async fn detect_endpoints(path: String) -> Result<Vec<Endpoint>, String> {
     .map_err(|e| format!("The endpoint scan failed unexpectedly: {e}"))?
 }
 
+/// One outbound API call found in the app (the consumer side of the contract).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCall {
+    pub method: String,
+    pub url: String,
+    pub file: String,
+    pub line: u32,
+}
+
+struct ApiCallPatterns {
+    fetch: Regex, // fetch("/x")            → g1 url (method assumed GET)
+    verb: Regex,  // axios/api.get("/x")    → g1 method, g2 url
+}
+
+impl ApiCallPatterns {
+    fn new() -> Self {
+        ApiCallPatterns {
+            fetch: Regex::new(r#"(?i)\bfetch\s*\(\s*["'\x60]([^"'\x60?]+)"#).unwrap(),
+            verb: Regex::new(r#"(?i)\b(?:axios|api|http|client|\$fetch|request)\.(get|post|put|patch|delete)\s*\(\s*["'\x60]([^"'\x60?]+)"#).unwrap(),
+        }
+    }
+
+    fn scan_line(&self, line: &str, lineno: u32, rel: &str, out: &mut Vec<ApiCall>) {
+        let mut push = |method: &str, url: &str| {
+            // Only keep things that look like API paths/URLs.
+            if url.starts_with('/') || url.starts_with("http") {
+                out.push(ApiCall {
+                    method: method.to_uppercase(),
+                    url: url.to_string(),
+                    file: rel.to_string(),
+                    line: lineno,
+                });
+            }
+        };
+        for c in self.verb.captures_iter(line) {
+            push(&c[1], &c[2]);
+        }
+        for c in self.fetch.captures_iter(line) {
+            push("GET", &c[1]);
+        }
+    }
+}
+
+fn scan_api_calls(
+    root: &Path,
+    dir: &Path,
+    pats: &ApiCallPatterns,
+    out: &mut Vec<ApiCall>,
+    files: &mut usize,
+) {
+    if *files > 1500 {
+        return;
+    }
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if SEARCH_SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            scan_api_calls(root, &p, pats, out, files);
+        } else {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "js" | "ts" | "jsx" | "tsx" | "mjs" | "cjs" | "vue" | "svelte") {
+                continue;
+            }
+            *files += 1;
+            if *files > 1500 {
+                return;
+            }
+            let content = match fs::read_to_string(&p) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if content.len() > 600_000 {
+                continue;
+            }
+            let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+            for (i, line) in content.lines().enumerate() {
+                pats.scan_line(line, (i as u32) + 1, &rel, out);
+            }
+        }
+    }
+}
+
+/// Heuristically list the API calls the app makes (the consumer side), so the
+/// contract view can flag drift against what the API actually exposes.
+#[tauri::command]
+async fn detect_api_calls(path: String) -> Result<Vec<ApiCall>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&path);
+        if !root.is_dir() {
+            return Err(format!("\"{}\" is not a folder.", root.display()));
+        }
+        let pats = ApiCallPatterns::new();
+        let mut out: Vec<ApiCall> = Vec::new();
+        let mut files = 0usize;
+        scan_api_calls(&root, &root, &pats, &mut out, &mut files);
+        out.sort_by(|a, b| a.url.cmp(&b.url).then(a.method.cmp(&b.method)));
+        out.dedup_by(|a, b| a.method == b.method && a.url == b.url && a.file == b.file && a.line == b.line);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("The API-call scan failed unexpectedly: {e}"))?
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
@@ -3845,6 +3979,7 @@ pub fn run() {
             write_file_text,
             check_syntax,
             detect_endpoints,
+            detect_api_calls,
             search_files,
             home_dir,
             open_in_editor,

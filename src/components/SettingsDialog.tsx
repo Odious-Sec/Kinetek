@@ -14,6 +14,8 @@ import {
   ExternalLinkIcon,
   FolderIcon,
   KeyIcon,
+  LockIcon,
+  TrashIcon,
   XIcon,
 } from "./icons";
 
@@ -28,16 +30,19 @@ interface Props {
   settings: Settings;
   onSave: (settings: Settings) => void;
   onClose: () => void;
+  /** Wipe all local data and return to first-run setup. */
+  onReset: () => void;
   notify: (kind: "ok" | "err", message: string) => void;
 }
 
-export default function SettingsDialog({ settings, onSave, onClose, notify }: Props) {
+export default function SettingsDialog({ settings, onSave, onClose, onReset, notify }: Props) {
   const [defaultDir, setDefaultDir] = useState(settings.defaultDir ?? "");
   const [defaultEditor, setDefaultEditor] = useState(settings.defaultEditor);
   const [aiProvider, setAiProvider] = useState(settings.aiProvider);
   const [apiKey, setApiKey] = useState("");
   const [keyExists, setKeyExists] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   const provider =
     AI_PROVIDERS.find((p) => p.id === aiProvider) ?? AI_PROVIDERS[0];
@@ -72,6 +77,7 @@ export default function SettingsDialog({ settings, onSave, onClose, notify }: Pr
         setApiKey("");
       }
       onSave({
+        ...settings,
         defaultDir: defaultDir.trim() || null,
         defaultEditor,
         aiProvider,
@@ -215,6 +221,48 @@ export default function SettingsDialog({ settings, onSave, onClose, notify }: Pr
               Get a {provider.name} key <ExternalLinkIcon className="h-3 w-3" />
             </button>
           </Field>
+
+          {/* Privacy + reset */}
+          <div className="rounded-xl border border-surface-border bg-surface-card/50 p-3">
+            <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
+              <LockIcon className="h-3.5 w-3.5 text-emerald-300" />
+              Offline-first — everything is stored on this device only. No cloud, no account.
+            </p>
+          </div>
+
+          <div className="border-t border-surface-border pt-4">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-600">
+              Danger zone
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              Reset wipes your saved projects, folders, settings, and all stored keys/tokens from
+              this device, and returns to first-run setup. Your project files on disk aren't touched.
+            </p>
+            {!confirmReset ? (
+              <button
+                onClick={() => setConfirmReset(true)}
+                className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/15"
+              >
+                <TrashIcon className="h-3.5 w-3.5" /> Reset Kinetek
+              </button>
+            ) : (
+              <div className="mt-2 flex items-center gap-2">
+                <span className="text-xs text-rose-200">Delete all local data?</span>
+                <button
+                  onClick={onReset}
+                  className="rounded-lg bg-rose-500/80 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-rose-500"
+                >
+                  Yes, reset
+                </button>
+                <button
+                  onClick={() => setConfirmReset(false)}
+                  className="rounded-lg border border-surface-border bg-surface-card px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-surface-hover"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-surface-border px-5 py-3">

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { DirEntry, SearchHit } from "../types";
 import { searchFiles } from "../lib/tauri";
+import { revealLabel } from "../lib/platform";
 import FileTree from "./FileTree";
 import { FileIcon, FolderIcon, SearchIcon, XIcon } from "./icons";
 
@@ -137,7 +138,7 @@ export default function FileBrowser({
                   {onReveal && (
                     <button
                       onClick={() => onReveal(toEntry(hit))}
-                      title="Open in Finder"
+                      title={revealLabel}
                       className="shrink-0 rounded p-1 text-slate-500 opacity-0 transition-opacity hover:text-slate-200 group-hover:opacity-100"
                     >
                       <FolderIcon className="h-3.5 w-3.5" />

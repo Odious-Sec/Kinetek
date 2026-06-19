@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { DirEntry } from "../types";
 import { readDir } from "../lib/tauri";
+import { revealLabel } from "../lib/platform";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -164,7 +165,7 @@ function Node({
         {onReveal && (
           <button
             onClick={() => onReveal(entry)}
-            title={entry.isDir ? "Open in Finder" : "Open file externally"}
+            title={entry.isDir ? revealLabel : "Open file externally"}
             className="shrink-0 rounded p-1 text-slate-500 opacity-0 transition-opacity hover:text-slate-200 group-hover:opacity-100"
           >
             <FolderIcon className="h-3.5 w-3.5" />

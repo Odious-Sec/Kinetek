@@ -16,9 +16,10 @@ import {
   AlertIcon,
   BotIcon,
   ExternalLinkIcon,
-  PlayIcon,
+  PlusIcon,
   RefreshIcon,
   SparkIcon,
+  UserIcon,
   XIcon,
 } from "./icons";
 
@@ -36,6 +37,15 @@ Rules:
 - Only CREATE or overwrite these Markdown files — do not modify any source code.
 - Keep each file focused and accurate.`;
 
+/** Preset prompt: sync the app↔API contract so each side knows the other. */
+const CONTRACT_PROMPT = `Sync this project's app and API so each side has accurate, up-to-date context about the other.
+
+1. Inspect \`api/\` and document the REAL contract it exposes — for every endpoint: method, path, request body/params, response shape, and auth. Inspect \`app/\` to see which of those endpoints it actually calls.
+2. Write or refresh a single \`CONTRACT.md\` at the project ROOT capturing that contract (the API is the source of truth). Flag any mismatches — app calls to a route the API doesn't expose, or endpoints the app never uses.
+3. Update \`app/CLAUDE.md\` so it states the app consumes the API defined in \`../CONTRACT.md\` and must follow it. Update \`api/CLAUDE.md\` so it states the API must honor \`../CONTRACT.md\` because the app depends on it. Create these files if missing.
+
+Only create/edit Markdown files — do NOT change any source code. Be accurate to the actual code you find.`;
+
 interface Props {
   project: Project;
   notify: (kind: "ok" | "err", message: string) => void;
@@ -43,9 +53,19 @@ interface Props {
 
 type Line = { line: string; stream: string };
 
+/** A single turn in the conversation. `label` (optional) is shown instead of the
+ *  full prompt for preset actions; `steps` are the tool-activity lines. */
+interface ChatMessage {
+  role: "user" | "assistant";
+  text: string;
+  steps: string[];
+  label?: string;
+}
+
 interface Parsed {
   text: string;
   steps: string[];
+  sessionId?: string;
 }
 
 /** Summarize a tool_use block into a short, human activity line. */
@@ -72,9 +92,12 @@ function formatTool(b: { name?: string; input?: Record<string, unknown> }): stri
   }
 }
 
-/** Parse Claude Code's stream-json (NDJSON) output into answer text + activity. */
+/** Parse Claude Code's stream-json (NDJSON) output into answer text + activity,
+ *  capturing the session id (from the `init`/`result` events) so follow-up
+ *  turns can `--resume` the same conversation. */
 function parseStream(lines: Line[]): Parsed {
   let text = "";
+  let sessionId: string | undefined;
   const steps: string[] = [];
   for (const l of lines) {
     if (l.stream === "stderr") continue;
@@ -88,6 +111,7 @@ function parseStream(lines: Line[]): Parsed {
       text += (text ? "\n" : "") + l.line;
       continue;
     }
+    if (typeof ev.session_id === "string") sessionId = ev.session_id;
     const type = ev.type as string;
     if (type === "assistant") {
       const msg = ev.message as { content?: Array<Record<string, unknown>> } | undefined;
@@ -100,11 +124,12 @@ function parseStream(lines: Line[]): Parsed {
       if (!text.trim() && typeof result === "string") text = result;
     }
   }
-  return { text, steps };
+  return { text, steps, sessionId };
 }
 
 /** Build a compact snapshot of what the user is looking at in Kinetek, so the
- *  agent has the app's context (not just the files on disk). */
+ *  agent has the app's context (not just the files on disk). Injected only on
+ *  the FIRST message of a session; follow-ups rely on session memory. */
 async function buildSnapshot(project: Project): Promise<string> {
   const [st, changes] = await Promise.all([
     gitStatus(project.path).catch(() => null),
@@ -136,20 +161,54 @@ const MODES: { id: ClaudeMode; label: string; hint: string }[] = [
   { id: "acceptEdits", label: "Auto-edit", hint: "Lets Claude Code make file changes in this project." },
 ];
 
+/** Render one assistant turn (activity steps + Markdown answer). */
+function AssistantBubble({ text, steps }: { text: string; steps: string[] }) {
+  return (
+    <div className="flex gap-2.5">
+      <span className="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-accent/15 text-accent-soft">
+        <BotIcon className="h-3.5 w-3.5" />
+      </span>
+      <div className="min-w-0 flex-1">
+        {steps.length > 0 && (
+          <div className="mb-2 space-y-0.5 rounded-lg border border-surface-border bg-surface-card/60 p-2">
+            {steps.map((s, i) => (
+              <div key={i} className="truncate font-mono text-[11px] text-slate-500" title={s}>
+                {s}
+              </div>
+            ))}
+          </div>
+        )}
+        {text.trim() ? (
+          <Markdown content={text} />
+        ) : (
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <RefreshIcon className="h-3.5 w-3.5 animate-spin" /> working…
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /**
- * Delegate a task to the installed Claude Code CLI, running in this project's
- * directory (so it has full project context) with a Kinetek state snapshot
- * injected. Output streams live. Uses the user's own Claude Code auth — Kinetek
- * stores no key for this.
+ * Multi-turn chat with the installed Claude Code CLI, running in this project's
+ * directory (so it has full project context). The first message injects a
+ * Kinetek state snapshot; follow-ups `--resume` the same Claude Code session so
+ * the conversation keeps its memory. Uses the user's own Claude Code auth.
  */
 export default function ClaudePanel({ project, notify }: Props) {
   const [avail, setAvail] = useState<Prerequisite | null | "loading">("loading");
-  const [prompt, setPrompt] = useState("");
+  const [input, setInput] = useState("");
   const [mode, setMode] = useState<ClaudeMode>("plan");
   const [running, setRunning] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  // Live streaming buffer for the in-progress assistant turn.
   const [lines, setLines] = useState<Line[]>([]);
 
   const runIdRef = useRef<string | null>(null);
+  const sessionRef = useRef<string | null>(null);
+  // Mirror of `lines` so the finally block can read the final buffer synchronously.
+  const linesRef = useRef<Line[]>([]);
   const unlistenRef = useRef<UnlistenFn[]>([]);
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -163,59 +222,117 @@ export default function ClaudePanel({ project, notify }: Props) {
       .catch(() => setAvail(null));
   }, []);
 
-  // Tear down listeners on unmount / project change.
+  // Switching projects starts a fresh conversation (a session is project-scoped).
   useEffect(() => {
-    return () => {
-      unlistenRef.current.forEach((u) => u());
-      unlistenRef.current = [];
-    };
+    cleanupListeners();
+    sessionRef.current = null;
+    linesRef.current = [];
+    setMessages([]);
+    setLines([]);
   }, [project.id]);
+
+  // Tear down listeners on unmount.
+  useEffect(() => {
+    return () => cleanupListeners();
+  }, []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [lines]);
+  }, [messages, lines]);
 
   function cleanupListeners() {
     unlistenRef.current.forEach((u) => u());
     unlistenRef.current = [];
   }
 
-  async function run(promptText: string = prompt, runMode: ClaudeMode = mode) {
+  /** Send a turn. `label` shows a short chip instead of the (full) prompt. */
+  async function send(promptText: string, runMode: ClaudeMode, label?: string) {
     if (!promptText.trim() || running) return;
     const id = `claude-${Date.now()}`;
     runIdRef.current = id;
+    setInput("");
+    linesRef.current = [];
     setLines([]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", text: promptText.trim(), steps: [], label },
+      { role: "assistant", text: "", steps: [] },
+    ]);
     setRunning(true);
 
     const onOut = await listen<{ runId: string; line: string; stream: string }>(
       "claude-output",
       (e) => {
         if (e.payload.runId !== id) return;
-        setLines((prev) => [...prev.slice(-4000), { line: e.payload.line, stream: e.payload.stream }]);
+        const line = { line: e.payload.line, stream: e.payload.stream };
+        linesRef.current = [...linesRef.current.slice(-4000), line];
+        setLines(linesRef.current);
+        // Capture the session id as soon as it appears so follow-ups resume it.
+        if (!sessionRef.current && e.payload.stream !== "stderr") {
+          try {
+            const ev = JSON.parse(e.payload.line.trim());
+            if (typeof ev.session_id === "string") sessionRef.current = ev.session_id;
+          } catch {
+            /* not a JSON line */
+          }
+        }
       }
     );
     unlistenRef.current.push(onOut);
 
+    // Inject the Kinetek snapshot only on the first message of the session.
+    const isFirst = !sessionRef.current;
     try {
-      const snapshot = await buildSnapshot(project);
-      const full = `${snapshot}\n\n${promptText.trim()}`;
-      await runClaudeAgent(id, project.path, full, runMode);
-      notify("ok", "Claude Code finished.");
+      const full = isFirst
+        ? `${await buildSnapshot(project)}\n\n${promptText.trim()}`
+        : promptText.trim();
+      await runClaudeAgent(id, project.path, full, runMode, sessionRef.current ?? undefined);
     } catch (e) {
       notify("err", typeof e === "string" ? e : String(e));
     } finally {
       setRunning(false);
       cleanupListeners();
+      // Commit the streamed turn into the assistant message so it persists,
+      // then clear the live buffer.
+      const parsed = parseStream(linesRef.current);
+      if (parsed.sessionId) sessionRef.current = parsed.sessionId;
+      setMessages((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === "assistant") {
+            next[i] = { ...next[i], text: parsed.text, steps: parsed.steps };
+            break;
+          }
+        }
+        return next;
+      });
+      linesRef.current = [];
+      setLines([]);
     }
   }
 
-  // One-click: have Claude Code write context docs for each part, so there's
-  // context ready before opening the IDE. Forces auto-edit (it writes files).
+  function onSubmit() {
+    void send(input, mode);
+  }
+
+  // Preset actions become messages in the conversation (short label shown, full
+  // prompt sent). Both write files, so they force auto-edit.
   function runDocs() {
     if (running) return;
-    setPrompt(DOCS_PROMPT);
-    setMode("acceptEdits");
-    void run(DOCS_PROMPT, "acceptEdits");
+    void send(DOCS_PROMPT, "acceptEdits", "Generate context docs");
+  }
+  function runContract() {
+    if (running) return;
+    void send(CONTRACT_PROMPT, "acceptEdits", "Sync API contract");
+  }
+
+  function newChat() {
+    if (running) return;
+    sessionRef.current = null;
+    linesRef.current = [];
+    setMessages([]);
+    setLines([]);
+    setInput("");
   }
 
   async function stop() {
@@ -229,7 +346,7 @@ export default function ClaudePanel({ project, notify }: Props) {
     }
   }
 
-  const parsed = useMemo(() => parseStream(lines), [lines]);
+  const live = useMemo(() => parseStream(lines), [lines]);
   const stderrLines = lines.filter((l) => l.stream === "stderr").map((l) => l.line);
 
   if (avail === "loading") {
@@ -276,33 +393,113 @@ export default function ClaudePanel({ project, notify }: Props) {
     );
   }
 
+  const empty = messages.length === 0;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* Prompt + controls */}
-      <div className="shrink-0 border-b border-surface-border p-3">
-        <div className="mb-2 flex items-center gap-2 text-xs text-slate-500">
-          <BotIcon className="h-4 w-4 text-accent-soft" />
-          <span className="text-slate-300">Claude Code</span>
-          <span className="text-slate-600">· runs in this project · uses your Claude sign-in</span>
-        </div>
+      {/* Header */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-surface-border px-3 py-2 text-xs text-slate-500">
+        <BotIcon className="h-4 w-4 text-accent-soft" />
+        <span className="text-slate-300">Claude Code</span>
+        <span className="hidden text-slate-600 sm:inline">· chat · uses your Claude sign-in</span>
+        <button
+          onClick={newChat}
+          disabled={running || empty}
+          title="Start a new conversation (clears history)"
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-surface-hover disabled:opacity-40"
+        >
+          <PlusIcon className="h-3.5 w-3.5" /> New chat
+        </button>
+      </div>
+
+      {/* Conversation */}
+      <div className="min-h-0 flex-1 overflow-auto bg-surface-base" data-selectable="true">
+        {empty ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 px-8 text-center text-xs text-slate-600">
+            <BotIcon className="h-6 w-6 text-slate-700" />
+            <p className="max-w-xs leading-relaxed">
+              Chat with Claude Code in this project. It remembers the conversation —
+              ask a follow-up and it keeps context.
+            </p>
+            <div className="flex flex-wrap justify-center gap-2">
+              <button
+                onClick={runDocs}
+                title="Have Claude Code write CLAUDE.md + README for app / api / root"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent-soft transition-colors hover:bg-accent/15"
+              >
+                <SparkIcon className="h-3.5 w-3.5" /> Generate context docs
+              </button>
+              <button
+                onClick={runContract}
+                title="Sync app↔API: write CONTRACT.md and point both CLAUDE.md files at it"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent-soft transition-colors hover:bg-accent/15"
+              >
+                <SparkIcon className="h-3.5 w-3.5" /> Sync API contract
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4 p-4">
+            {messages.map((m, i) => {
+              const isLastAssistant =
+                m.role === "assistant" && i === messages.length - 1 && running;
+              if (m.role === "user") {
+                return (
+                  <div key={i} className="flex justify-end gap-2.5">
+                    <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-accent/15 px-3 py-2 text-sm text-slate-100">
+                      {m.label ? (
+                        <span className="inline-flex items-center gap-1.5 font-medium text-accent-soft">
+                          <SparkIcon className="h-3.5 w-3.5" /> {m.label}
+                        </span>
+                      ) : (
+                        <span className="whitespace-pre-wrap break-words">{m.text}</span>
+                      )}
+                    </div>
+                    <span className="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-surface-card text-slate-400">
+                      <UserIcon className="h-3.5 w-3.5" />
+                    </span>
+                  </div>
+                );
+              }
+              // Assistant: the streaming turn renders from the live buffer.
+              return (
+                <AssistantBubble
+                  key={i}
+                  text={isLastAssistant ? live.text : m.text}
+                  steps={isLastAssistant ? live.steps : m.steps}
+                />
+              );
+            })}
+            {running && stderrLines.length > 0 && (
+              <pre className="ml-8 whitespace-pre-wrap break-words rounded-lg border border-surface-border bg-surface-card p-2.5 font-mono text-[11px] leading-relaxed text-amber-300/80">
+                {stderrLines.join("\n")}
+              </pre>
+            )}
+            <div ref={endRef} />
+          </div>
+        )}
+      </div>
+
+      {/* Composer */}
+      <div className="shrink-0 border-t border-surface-border p-3">
         <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={3}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              onSubmit();
+            }
+          }}
+          rows={2}
           disabled={running}
-          placeholder="Ask Claude Code to do something in this project — e.g. “add input validation to the signup form” or “explain how auth works”."
+          placeholder={
+            sessionRef.current
+              ? "Reply to Claude Code… (Enter to send, Shift+Enter for newline)"
+              : "Ask Claude Code to do something in this project…"
+          }
           className="w-full resize-y rounded-lg border border-surface-border bg-surface-base px-3 py-2 text-sm text-slate-100 outline-none transition-colors placeholder:text-slate-600 focus:border-accent/60 disabled:opacity-60"
         />
-        <button
-          onClick={runDocs}
-          disabled={running}
-          title="Have Claude Code write CLAUDE.md + README for app / api / root"
-          className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent-soft transition-colors hover:bg-accent/15 disabled:opacity-50"
-        >
-          <SparkIcon className="h-3.5 w-3.5" />
-          Generate context docs
-          <span className="text-slate-500">CLAUDE.md + README · app · api · root</span>
-        </button>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {/* Mode */}
           <div className="flex items-center gap-1">
@@ -332,12 +529,12 @@ export default function ClaudePanel({ project, notify }: Props) {
               </button>
             ) : null}
             <button
-              onClick={() => run()}
-              disabled={running || !prompt.trim()}
+              onClick={onSubmit}
+              disabled={running || !input.trim()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-glow disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {running ? <RefreshIcon className="h-3.5 w-3.5 animate-spin" /> : <PlayIcon className="h-3.5 w-3.5" />}
-              {running ? "Running…" : "Run"}
+              {running ? <RefreshIcon className="h-3.5 w-3.5 animate-spin" /> : <SparkIcon className="h-3.5 w-3.5" />}
+              {running ? "Working…" : "Send"}
             </button>
           </div>
         </div>
@@ -346,52 +543,6 @@ export default function ClaudePanel({ project, notify }: Props) {
             <AlertIcon className="h-3.5 w-3.5 shrink-0" />
             Auto-edit lets Claude Code modify files in this project. Review changes in the Source-control tab afterwards.
           </p>
-        )}
-      </div>
-
-      {/* Streamed output — rendered as Markdown (headings, lists, highlighted code) */}
-      <div className="min-h-0 flex-1 overflow-auto bg-surface-base" data-selectable="true">
-        {lines.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-3 text-center text-xs text-slate-600">
-            {running ? (
-              <>
-                <span className="relative grid h-10 w-10 place-items-center">
-                  <span className="absolute inset-0 animate-pulse-ring rounded-full bg-accent/30" />
-                  <BotIcon className="relative h-5 w-5 text-accent-soft" />
-                </span>
-                Claude is working…
-              </>
-            ) : (
-              <>
-                <BotIcon className="h-6 w-6 text-slate-700" />
-                Ask Claude Code to do something — its response shows here.
-              </>
-            )}
-          </div>
-        ) : (
-          <div className="p-4">
-            {parsed.steps.length > 0 && (
-              <div className="mb-3 space-y-0.5 rounded-lg border border-surface-border bg-surface-card/60 p-2">
-                {parsed.steps.map((s, i) => (
-                  <div key={i} className="truncate font-mono text-[11px] text-slate-500" title={s}>
-                    {s}
-                  </div>
-                ))}
-              </div>
-            )}
-            {parsed.text.trim() && <Markdown content={parsed.text} />}
-            {stderrLines.length > 0 && (
-              <pre className="mt-3 whitespace-pre-wrap break-words rounded-lg border border-surface-border bg-surface-card p-2.5 font-mono text-[11px] leading-relaxed text-amber-300/80">
-                {stderrLines.join("\n")}
-              </pre>
-            )}
-            {running && (
-              <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
-                <RefreshIcon className="h-3.5 w-3.5 animate-spin" /> working…
-              </div>
-            )}
-            <div ref={endRef} />
-          </div>
         )}
       </div>
     </div>

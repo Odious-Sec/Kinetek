@@ -12,6 +12,46 @@
 > **[`PROJECT.md`](./PROJECT.md)** — the detailed companion reference. Read it
 > when you're about to work on a subsystem; you don't need it just to orient.
 
+## ⏭️ Picking up where we left off (next session, in priority order)
+
+The repo is at a clean build (`npm run build` + `cargo check` green).
+
+### 1. ✅ DONE — Claude Code dock is now a real multi-turn CHAT
+The dock no longer one-shots: it holds a conversation via Claude Code **session
+resume**.
+- **Backend** (`src-tauri/src/lib.rs`): `run_claude_agent` / `run_claude_inner`
+  take `session_id: Option<String>`; the inner fn builds args as a `Vec<String>`
+  and appends `--resume <id>` when set & non-empty (alongside `-p`,
+  `--output-format stream-json`, `--verbose`, `--permission-mode <mode>`).
+- **Bridge** (`src/lib/tauri.ts`): `runClaudeAgent(runId, projectPath, prompt,
+  mode, sessionId?)` passes `sessionId` through as `{ … sessionId }`.
+- **Frontend** (`src/components/ClaudePanel.tsx`): rewritten into a chat — a
+  `messages: ChatMessage[]` (`{role; text; steps[]; label?}`) list rendered as
+  user/assistant bubbles + a bottom composer (Enter sends, Shift+Enter newline).
+  On send it appends the user msg + an empty assistant msg, streams into a
+  `linesRef`/`lines` buffer (the last assistant bubble renders live from
+  `parseStream(lines)` while running), and on finish commits the parsed turn into
+  the message. **`sessionRef`** captures `session_id` from the stream-json events
+  (`parseStream` now also returns `sessionId`); it's passed on every follow-up so
+  context carries. The `buildSnapshot` Kinetek context is injected **only on the
+  first message** (sessionRef null). A **New chat** button clears
+  `sessionRef`/`messages`; switching projects auto-resets. The **Generate context
+  docs** / **Sync API contract** presets are now messages (short `label` chip
+  shown, full `DOCS_PROMPT`/`CONTRACT_PROMPT` sent, mode `acceptEdits`), surfaced
+  on the empty state. Added `UserIcon` to `icons.tsx`. Kept the not-installed UI,
+  MODES, Stop, Markdown render.
+
+### 2. Kinetek-aware CLAUDE.md with predefined part paths (do this next)
+An option to drop a project **`CLAUDE.md`** that's pre-seeded
+with the part layout so Claude Code auto-knows where to work — the `app/`,
+`api/`, `database/` paths (from `ProjectInfo.stack` at creation + the detected
+parts on disk) and a note that it should operate in those folders unless told
+otherwise. Likely a one-click action (similar to "Generate context docs") that
+writes a structured root `CLAUDE.md` from Kinetek's known structure (no LLM
+needed for the path scaffold), optionally enriched by Claude. Open question the
+user raised: *where* the canonical Kinetek CLAUDE.md lives and how it ties into
+the app↔API contract docs — decide alongside.
+
 ## What Kinetek is
 
 A local-first **macOS/Windows desktop app**: a highly visual, human-readable
@@ -87,8 +127,10 @@ Both must be clean before you call something done. For a shippable bundle:
   `folders`, `assignments`, `settings` (persisted as one `Organization`), the
   current `view` (`"home" | "projects" | "explorer" | "github" | "terminal"`,
   default `"home"`), and `expandedId` — **selecting a project anywhere opens the
-  full-page `ProjectPage`** (there is no side inspector anymore). Loads the
-  workspace on mount, saves on any change (guarded by `orgLoaded`). All the handlers
+  full-page `ProjectPage`** (there is no side inspector anymore). On first run
+  (`!settings.onboarded`, desktop) it shows `Onboarding` instead of the main UI;
+  `handleReset` wipes the workspace + keychain secrets and re-triggers it. Loads
+  the workspace on mount, saves on any change (guarded by `orgLoaded`). Handlers
   (scan, create, delete, preview, explain, etc.) live here and are passed down.
 - `types.ts` — shared domain types; **mirror of the Rust structs**.
 - `index.css` — Tailwind layers + a few globals.
@@ -146,8 +188,9 @@ Both must be clean before you call something done. For a shippable bundle:
   `components/wizard/` + wire it into the orchestrator's body/footer + `Phase`.
 - `ProjectPage.tsx` — **full-page** project view (replaces the whole content
   area), reached by selecting a project. A **breadcrumb** (`Projects › <name>`)
-  navigates back. Tabs: Overview / Files / (API, when an `api/` part exists) /
-  History / Source control (Overview is full-width; header actions pinned right).
+  navigates back. Tabs: Overview / Files / (API + Contract, when the relevant
+  parts exist) / History / Source control (Overview is full-width; header
+  actions pinned right).
   The **Files**
   tab is an **IDE-style editor**: an **App / API / Database** part switcher (for
   assembled projects) re-roots the tree to `app/`/`api/`/`database/`, and clicking
@@ -201,22 +244,40 @@ Both must be clean before you call something done. For a shippable bundle:
   project has an `api/` part): lists detected routes (method · path · file:line)
   from `detect_endpoints`, filterable, click a row → opens the file in the editor.
   Heuristic, framework-agnostic. First step toward a request tester.
+- `ContractPanel.tsx` — the **Contract** tab (shown when both `app/` + `api/`
+  exist): compares what the API exposes (`detect_endpoints`) against what the app
+  calls (`detect_api_calls`), flags **drift** (calls with no endpoint; unused
+  endpoints), and **"Write CONTRACT.md"** snapshots it to the root. The deeper
+  Claude-driven sync (shapes + auto-updating both CLAUDE.md) is the **"Sync API
+  contract"** button in `ClaudePanel`.
 - `ClaudePanel.tsx` — the **Claude Code** right-dock panel in `ProjectPage`
-  (toggled from the header, resizable): delegates a
-  prompt to the installed `claude` CLI in the project dir, injecting a Kinetek
-  state snapshot (project + live git status/changes) so the agent knows what the
-  user is looking at. Streams output live; Plan vs Auto-edit mode. Shows an
+  (toggled from the header, resizable): a **multi-turn CHAT** with the installed
+  `claude` CLI in the project dir. Holds a conversation via Claude Code **session
+  resume** — `sessionRef` captures `session_id` from the stream-json events and
+  is passed on every follow-up so context carries. The Kinetek state snapshot
+  (project + live git status/changes) is injected **only on the first message**;
+  follow-ups rely on session memory. Streams output live (the active assistant
+  bubble renders from `parseStream(lines)` while running); Plan vs Auto-edit mode;
+  Enter sends / Shift+Enter newline; **New chat** resets the session. Shows an
   install hint if `claude` isn't found (`check_tool`). Output is rendered with
   `Markdown.tsx` (highlighted code, headings, lists) — not raw terminal text. Has
   a **"Generate context docs"** action (`DOCS_PROMPT`, forces `acceptEdits`):
   Claude Code writes `CLAUDE.md` + `README.md` into `app/`, `api/`, and the root
-  (skipping absent parts) so there's context before opening the IDE.
+  (skipping absent parts) so there's context before opening the IDE. Also a
+  **"Sync API contract"** action (`CONTRACT_PROMPT`): writes a root `CONTRACT.md`
+  + points both `app/CLAUDE.md` and `api/CLAUDE.md` at it (the app↔API sync).
 - `RefsSidebar.tsx` — our-style (NOT Fork's) refs panel: collapsible
   Branches/Remotes/Tags/Stashes with create-branch, checkout, delete-branch, and
   stash save/apply/pop/drop. Lives in `ProjectPage`'s History tab beside the
   graph. `CommitGraph` has a **"Create branch here"** action in its detail pane.
   Both share a `gitRefreshKey` so a mutation in one refreshes the other.
+- `Onboarding.tsx` — **first-run configuration** page (shown when
+  `settings.onboarded` is false, desktop only): a privacy/offline statement +
+  optional AI key, Claude Code check, GitHub token, and workspace defaults. Every
+  step optional; "Finish"/"Skip" sets `onboarded: true`.
 - `SettingsDialog.tsx` / `EditProjectDialog.tsx` / `ConfirmDialog.tsx` — dialogs.
+  SettingsDialog has a **Danger zone → Reset** (wipes the saved workspace + all
+  keychain secrets via App's `handleReset`, returns to onboarding).
 - `PreviewDialog.tsx` — the **single entry point for Preview**: shows the
   detected kind, lists requirements with preview-only installs, runs it, and on
   failure shows a friendly reason + raw dev output behind a toggle. App opens it
@@ -274,7 +335,9 @@ One file, grouped by feature. Command catalog (all registered in
   (on-save diagnostics — Python via `py_compile`, Go via `gofmt -e`; `[]` for
   Monaco-handled or unsupported langs), `detect_endpoints(path)` (heuristic
   route scan via `regex` for the API explorer — Express/Nest/FastAPI/Flask/
-  ASP.NET/Go → `Endpoint{method,route,file,line}`), `search_files`, `home_dir`.
+  ASP.NET/Go → `Endpoint{method,route,file,line}`), `detect_api_calls(path)`
+  (heuristic scan of the app for fetch/axios calls → `ApiCall{method,url,file,line}`
+  — the consumer side of the contract), `search_files`, `home_dir`.
 - **Open externally:** `open_in_editor(path, editor, file?)` (vscode/cursor/zed/
   finder; `file` opens `path` as the workspace AND focuses that file —
   `code <folder> <file>`), `open_in_vscode`, `open_in_file_manager`, `log_error`.
@@ -357,6 +420,36 @@ One file, grouped by feature. Command catalog (all registered in
 - The bundle identifier is `com.kinetek.app`, which Tauri warns about (ends in
   `.app`). Cosmetic; flagged for a future rename to e.g. `com.kinetek.desktop`.
 - Builds are **unsigned** — first launch hits Gatekeeper (right-click → Open).
+
+## Cross-platform (macOS / Windows / Linux)
+
+Kinetek targets all three. The backend is `cfg`-gated throughout — keep it that way.
+- **Keychain backends are per-OS and must each be enabled.** `keyring` needs a
+  backend feature *per platform*: `apple-native` + `windows-native` in the base
+  `[dependencies]`, and the **Linux** backend (`sync-secret-service` +
+  `crypto-rust`, pure-Rust Secret Service via zbus — needs no system libdbus) in
+  a `[target.'cfg(target_os = "linux")'.dependencies]` block (Cargo unions the
+  features). **Without the Linux entry, secrets silently don't persist there.**
+  Linux secrets need a running Secret Service daemon (GNOME Keyring / KWallet).
+- **Process exec** goes through `make_command()` (`cmd /C` on Windows, direct on
+  Unix); **file manager** via `open`/`explorer`/`xdg-open`; **Trash** via the
+  `trash` crate (NSFileManager on macOS, freedesktop/Recycle Bin elsewhere).
+- **Auto-install** is brew (macOS) / winget (Windows) only — on Linux
+  `install_tool` returns a friendly "install via your package manager" message
+  (graceful, not an error). Preview/IDE features degrade the same way.
+- **The window** uses native decorations everywhere; macOS adds
+  `titleBarStyle: "Overlay"` so the traffic lights float over the custom
+  `TitleBar`. On Windows/Linux that style is ignored, so the OS draws its own
+  title bar above the custom header — functional, slightly redundant. `TitleBar`
+  reads `src/lib/platform.ts` (`isMac`) to inset for the traffic lights on macOS
+  and left-align elsewhere. **No frontend code splits filesystem paths by `/`** —
+  paths come from the backend whole and are passed back whole (Windows-safe).
+- **UI platform detection** lives in `src/lib/platform.ts` (`OS_NAME`, `isMac`,
+  `shortcut("S")` → ⌘S/Ctrl+S, `revealLabel` → "Reveal in Finder/Explorer/file
+  manager"), derived synchronously from `navigator.userAgent` (no os plugin).
+- **Can't compile-test other targets from a mac** (`cargo check` only resolves
+  the Linux deps into `Cargo.lock`, doesn't build them). The real check is a
+  build on each OS — or CI.
 
 ## User context
 

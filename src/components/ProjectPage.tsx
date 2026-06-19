@@ -8,6 +8,7 @@ import GitPanel from "./GitPanel";
 import DiffViewer from "./DiffViewer";
 import ClaudePanel from "./ClaudePanel";
 import ApiPanel from "./ApiPanel";
+import ContractPanel from "./ContractPanel";
 import StatusBadge from "./StatusBadge";
 import {
   BotIcon,
@@ -15,6 +16,7 @@ import {
   ChevronRightIcon,
   CodeIcon,
   EyeIcon,
+  GitCompareIcon,
   FileIcon,
   FolderIcon,
   GitBranchIcon,
@@ -40,7 +42,7 @@ interface ProjectPart {
   path: string;
 }
 
-type Tab = "overview" | "files" | "api" | "history" | "git";
+type Tab = "overview" | "files" | "api" | "contract" | "history" | "git";
 
 interface Props {
   project: Project;
@@ -159,6 +161,9 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
     { id: "files", label: "Files", icon: <FileIcon className="h-4 w-4" /> },
     ...(apiPart
       ? [{ id: "api" as Tab, label: "API", icon: <ServerIcon className="h-4 w-4" /> }]
+      : []),
+    ...(appPart && apiPart
+      ? [{ id: "contract" as Tab, label: "Contract", icon: <GitCompareIcon className="h-4 w-4" /> }]
       : []),
     { id: "history", label: "History", icon: <GitCommitIcon className="h-4 w-4" /> },
     { id: "git", label: "Source control", icon: <GitBranchIcon className="h-4 w-4" /> },
@@ -380,6 +385,15 @@ export default function ProjectPage({ project, onBack, onOpenPath, onPreview, no
           <ApiPanel
             path={apiPart.path}
             onOpenFile={(rel) => onOpenPath(apiPart.path, `${apiPart.path}/${rel}`)}
+            notify={notify}
+          />
+        )}
+
+        {tab === "contract" && appPart && apiPart && (
+          <ContractPanel
+            rootPath={project.path}
+            appPath={appPart.path}
+            apiPath={apiPart.path}
             notify={notify}
           />
         )}

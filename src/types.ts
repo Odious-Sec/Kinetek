@@ -119,12 +119,15 @@ export interface Settings {
   defaultEditor: string;
   /** AI provider id (see lib/ai.ts). */
   aiProvider: string;
+  /** Whether the first-run setup has been completed. */
+  onboarded?: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   defaultDir: null,
   defaultEditor: "vscode",
   aiProvider: "gemini",
+  onboarded: false,
 };
 
 /** The whole persisted workspace: cards, folders, assignments, settings. */
@@ -208,6 +211,14 @@ export interface Endpoint {
   method: string;
   route: string;
   /** Path relative to the scanned API folder. */
+  file: string;
+  line: number;
+}
+
+/** An outbound API call the app makes — the consumer side (mirrors Rust). */
+export interface ApiCall {
+  method: string;
+  url: string;
   file: string;
   line: number;
 }

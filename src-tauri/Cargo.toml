@@ -26,6 +26,9 @@ serde_json = "1"
 # Cross-platform "move to Trash/Recycle Bin" so deletes are recoverable.
 trash = "5"
 # OS keychain access for the user's AI API key (never stored in plaintext).
+# Per-OS native backends: macOS Keychain, Windows Credential Manager. The Linux
+# backend (Secret Service — GNOME Keyring / KWallet) is added in the Linux-only
+# target block below so secrets persist there too.
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 # Real PTY for the in-app interactive terminal (so prompts/colors/TUIs work).
 portable-pty = "0.8"
@@ -35,6 +38,12 @@ regex = "1"
 # Unix-only: signal a dev server's whole process group when stopping a preview.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux-only keychain backend: the Secret Service API (GNOME Keyring / KWallet)
+# via a pure-Rust D-Bus client (`crypto-rust` avoids needing system libdbus).
+# Cargo unions these features with the base `keyring` entry when targeting Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 # Smaller, faster release binaries for a desktop app.
 [profile.release]

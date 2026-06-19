@@ -20,6 +20,7 @@ import type {
   Prerequisite,
   PreviewInfo,
   PreviewStatus,
+  ApiCall,
   Commit,
   Diagnostic,
   Endpoint,
@@ -74,9 +75,10 @@ export async function runClaudeAgent(
   runId: string,
   projectPath: string,
   prompt: string,
-  mode: ClaudeMode
+  mode: ClaudeMode,
+  sessionId?: string
 ): Promise<void> {
-  return invoke("run_claude_agent", { runId, projectPath, prompt, mode });
+  return invoke("run_claude_agent", { runId, projectPath, prompt, mode, sessionId });
 }
 
 /** Stop a running Claude Code agent by run id. */
@@ -359,6 +361,11 @@ export async function checkSyntax(path: string): Promise<Diagnostic[]> {
 /** Heuristically detect the HTTP routes an API exposes (for the API explorer). */
 export async function detectEndpoints(path: string): Promise<Endpoint[]> {
   return invoke<Endpoint[]>("detect_endpoints", { path });
+}
+
+/** Heuristically detect the API calls the app makes (the consumer side). */
+export async function detectApiCalls(path: string): Promise<ApiCall[]> {
+  return invoke<ApiCall[]>("detect_api_calls", { path });
 }
 
 /** Recursively find files/folders under root whose name matches the query. */

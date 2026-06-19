@@ -209,6 +209,9 @@ the TS side passes (camelCase) — Tauri maps them to the Rust snake_case params
   for Express/Fastify, NestJS decorators, FastAPI, Flask, ASP.NET ([Http*] +
   minimal-API .Map*), and Go (net/http/gin/chi). `Endpoint{method,route,file,line}`.
   Powers `ApiPanel`. Not a real parser — best-effort surface map.
+- `detect_api_calls(path) -> Vec<ApiCall>` — the consumer mirror: scans the app
+  for `fetch(...)` / `axios|api.get(...)` call sites → `ApiCall{method,url,file,
+  line}`. Powers `ContractPanel`'s drift check (app↔API).
 - `read_file_text(path) -> FileContent` — UTF-8 only; flags `binary`,
   `tooLarge`, `truncated`; caps ~2MB / 400k chars.
 - `search_files(root, query) -> Vec<SearchHit>` — recursive, case-insensitive
@@ -241,7 +244,7 @@ The TS mirrors live in `src/types.ts`. Keep them in lockstep by hand.
 | `PreviewStatus`   | `PreviewStatus`  | previewable, kind, runner, script, needsInstall, requirements[], ready, message, how |
 | `PreviewInfo`     | `PreviewInfo`    | id, url (empty = native, no webview) |
 | `Folder`          | `Folder`         | id, name |
-| `Settings`        | `Settings`       | defaultDir, defaultEditor, aiProvider |
+| `Settings`        | `Settings`       | defaultDir, defaultEditor, aiProvider, onboarded |
 | `Organization`    | `Organization`   | projects[], folders[], assignments{}, settings |
 | `ProjectContext`  | `ProjectContext` | name, readme, packageJson |
 | `GitStatus`       | `GitStatus`      | branch, dirty, ahead, behind, lastCommit, lastCommitRelative |
@@ -253,6 +256,7 @@ The TS mirrors live in `src/types.ts`. Keep them in lockstep by hand.
 | `FileContent`     | `FileContent`    | content, truncated, binary, tooLarge, size |
 | `Diagnostic`      | `Diagnostic`     | line, column, message, severity |
 | `Endpoint`        | `Endpoint`       | method, route, file, line |
+| `ApiCall`         | `ApiCall`        | method, url, file, line |
 | `SearchHit`       | `SearchHit`      | name, path, isDir, rel |
 
 `ProjectStatus` (TS only, the `status` string): `"Live" | "In Development" | "On Hold"`.
@@ -302,8 +306,17 @@ Frontend-only types (no Rust mirror): `Template` (now with `kinds: AppKind[]`,
   part folder, or **"Open this file"** = the part folder as workspace + the file
   focused (`code <folder> <file>`). A **Preview** button → `onPreview` opens
   `PreviewDialog` for the `app/` part (assembled) or the root (flat).
-- Dialog/transient flags: `wizardOpen`, `pendingDelete`, `pendingInstall`,
+- Dialog/transient flags: `wizardOpen`, `pendingDelete`, `previewProject`,
   `editingProject`, `settingsOpen`, `explainingId`, `scanning`, toasts.
+- **First run:** `Settings.onboarded` (Rust `#[serde(default)]`, TS optional)
+  gates a full-screen `Onboarding` page (`needsOnboarding = isTauri && orgLoaded
+  && !onboarded`). It saves optional AI key + GitHub token to the keychain and
+  the workspace defaults to settings. **Reset** (`handleReset`, surfaced in
+  SettingsDialog's Danger zone) deletes every `apikey:<provider>` + the GitHub
+  token from the keychain, clears the in-memory workspace, and sets
+  `onboarded: false` (the save effect persists the wipe) → back to Onboarding.
+  NB: `SettingsDialog.handleSave` spreads the existing `settings` so it doesn't
+  drop `onboarded`.
 
 Data flow: components are presentational and receive handlers as props. All
 handlers (`handleScanFolder`, `handleCreated`, `handleConfirmDelete`,
